@@ -12,7 +12,7 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urlsplit, pa
 # ================== НАСТРОЙКИ ==================
 EBAY_URLS = [
     # можно оставлять исходные ссылки — код сам уберёт _stpos и _fcid
-    "https://www.ebay.com/sch/i.html?_udlo=100&_nkw=garmin+astro+320+&_sacat=0&_fcid=1&_stpos=19720",
+    "https://www.ebay.com/sch/i.html?_nkw=garmin+astro+320&_sacat=0&_from=R40&_trksid=p4432023.m570.l1312",
 ]
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
