@@ -22,14 +22,12 @@ EBAY_URLS = [
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = [cid.strip() for cid in os.getenv("CHAT_ID", "").split(",") if cid.strip()]
 
-# Прокси перечисляем через запятую, пример:
-# PROXIES=http://1.2.3.4:8080,http://user:pass@5.6.7.8:1080
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]
 
-CHECK_INTERVAL = 180           # базовый интервал проверок (сек)
-REPORT_INTERVAL = 1800         # отчёт раз в 30 минут
-ERROR_NOTIFY_INTERVAL = 1800   # уведомления об ошибках не чаще, чем раз в 30 мин
-BACKOFF_THRESHOLD = 3          # при 3+ подряд ошибках — усиленный бэкофф
+CHECK_INTERVAL = 180
+REPORT_INTERVAL = 1800
+ERROR_NOTIFY_INTERVAL = 1800
+BACKOFF_THRESHOLD = 3
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,7 +38,7 @@ HEADERS = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# Логи (консоль + файл с ротацией)
+# Логи
 # ─────────────────────────────────────────────────────────────
 logger = logging.getLogger("ebay-bot")
 logger.setLevel(logging.INFO)
@@ -67,7 +65,6 @@ consecutive_errors = 0
 # Вспомогательные функции
 # ─────────────────────────────────────────────────────────────
 def proxy_cycle(proxies_list):
-    """Бесконечный циклический итер по прокси-словарам (или None)."""
     if not proxies_list:
         while True:
             yield None
@@ -79,10 +76,6 @@ def proxy_cycle(proxies_list):
 _proxy_iter = proxy_cycle(PROXIES)
 
 def make_scraper_with_retries():
-    """
-    Создаёт cloudscraper и HTTP-адаптер (пулы соединений).
-    Ретраи по статусам отключаем — управляем вручную.
-    """
     s = cloudscraper.create_scraper()
     adapter = HTTPAdapter(
         max_retries=Retry(total=0, connect=0, read=0, redirect=0, raise_on_status=False),
@@ -94,12 +87,8 @@ def make_scraper_with_retries():
     return s
 
 def fetch_listings(url: str):
-    """
-    Грузит выдачу eBay с ручными ретраями/бэкоффом и сменой прокси.
-    Возвращает список {id,title,price,link}.
-    """
     attempts = 4
-    backoff = 3  # начальная задержка между попытками
+    backoff = 3
     last_exc = None
 
     for attempt in range(1, attempts + 1):
@@ -116,10 +105,9 @@ def fetch_listings(url: str):
                 url,
                 headers=HEADERS,
                 proxies=current_proxy,
-                timeout=(20, 45),  # (connect, read)
+                timeout=(20, 45),
             )
 
-            # eBay может возвращать 503 (anti-bot/нагрузка)
             if resp.status_code == 503:
                 logger.warning("Получен 503 от eBay. Меняю прокси и жду перед повтором.")
                 time.sleep(backoff)
@@ -127,21 +115,26 @@ def fetch_listings(url: str):
                 continue
 
             resp.raise_for_status()
-
             soup = BeautifulSoup(resp.text, "html.parser")
-            items = []
-            for card in soup.select(".s-item"):
+
+            raw_cards = soup.select("li.s-item")
+            valid_items = []
+            for card in raw_cards:
                 title_tag = card.select_one(".s-item__title")
-                price_tag = card.select_one(".s-item__price")
                 link_tag  = card.select_one(".s-item__link")
-                if not title_tag or not price_tag or not link_tag:
+                if not title_tag or not link_tag:
                     continue
+                price_tag = card.select_one(".s-item__price")
+
                 title = title_tag.get_text(strip=True)
-                price = price_tag.get_text(strip=True)
                 link  = link_tag.get("href", "")
+                price = price_tag.get_text(strip=True) if price_tag else "Цена не указана"
                 item_id = link.split("/")[-1].split("?")[0] or link
-                items.append({"id": item_id, "title": title, "price": price, "link": link})
-            return items
+
+                valid_items.append({"id": item_id, "title": title, "price": price, "link": link})
+
+            logger.info(f"Всего карточек: {len(raw_cards)}, валидных: {len(valid_items)}")
+            return valid_items
 
         except Exception as e:
             last_exc = e
@@ -149,7 +142,6 @@ def fetch_listings(url: str):
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
-    # Все попытки исчерпаны — отдаём последнюю ошибку вверх
     raise last_exc
 
 def send_telegram_message(text: str):
@@ -171,7 +163,6 @@ def send_telegram_message(text: str):
 logger.info(f"Сервис запущен. Интервал проверок: {CHECK_INTERVAL}s. Прокси: {PROXIES or 'нет'}")
 send_telegram_message("✅ Бот успешно запущен и готов отслеживать eBay 🔍")
 
-# Инициализация: помечаем текущие лоты как виденные
 for url in EBAY_URLS:
     try:
         listings = fetch_listings(url)
@@ -191,7 +182,7 @@ while True:
     for url in EBAY_URLS:
         try:
             listings = fetch_listings(url)
-            logger.info(f"Найдено {len(listings)} объявлений по {url}")
+            logger.info(f"Получено {len(listings)} валидных объявлений по {url}")
 
             new_here = 0
             for it in listings:
@@ -207,17 +198,15 @@ while True:
                     )
 
             logger.info(f"Новых объявлений в этой проверке: {new_here}")
-            consecutive_errors = 0  # сброс счётчика ошибок при успехе
+            consecutive_errors = 0
 
         except Exception as e:
             logger.warning(f"Ошибка при проверке {url}: {e}")
             consecutive_errors += 1
-            # Уведомляем об ошибке не чаще, чем раз в ERROR_NOTIFY_INTERVAL
             if datetime.now() - last_error_time > timedelta(seconds=ERROR_NOTIFY_INTERVAL):
                 send_telegram_message(f"⚠️ Ошибка при проверке {url}: {e}")
                 last_error_time = datetime.now()
 
-    # Периодический отчёт (heartbeat)
     if datetime.now() - last_report_time > timedelta(seconds=REPORT_INTERVAL):
         report = (
             "📊 Отчёт за последние 30 минут\n"
@@ -232,12 +221,11 @@ while True:
         checks_count = 0
         new_items_count = 0
 
-    # Пауза: базовый интервал + джиттер, а при серии ошибок — усиленный бэкофф
     if consecutive_errors >= BACKOFF_THRESHOLD:
-        delay = min(CHECK_INTERVAL * 3, 3600)  # не больше часа
+        delay = min(CHECK_INTERVAL * 3, 3600)
         logger.warning(f"{consecutive_errors} ошибок подряд. Усиленная пауза: {delay} сек.")
         time.sleep(delay)
     else:
         jitter = random.randint(-30, 30)
-        delay = max(60, CHECK_INTERVAL + jitter)  # минимум минута
+        delay = max(60, CHECK_INTERVAL + jitter)
         time.sleep(delay)
