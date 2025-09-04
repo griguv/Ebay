@@ -1,364 +1,248 @@
+# bot.py
 import os
-import re
-import json
 import time
 import logging
-import requests
+import random
+import re
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
 import cloudscraper
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urlsplit, parse_qsl
 
-# ================== НАСТРОЙКИ ==================
+# =============== НАСТРОЙКИ ===============
 EBAY_URLS = [
-    # можно оставлять исходные ссылки — код сам уберёт _stpos и _fcid
-    "https://www.ebay.com/sch/i.html?_nkw=garmin+astro+320&_sacat=0&_from=R40&_trksid=p4432023.m570.l1312",
+    # твой исходный поиск
+    "https://www.ebay.com/sch/i.html?_udlo=100&_nkw=garmin+astro+320+&_sacat=0&_stpos=19720&_fcid=1",
 ]
 
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))   # 3 мин
+PAGES_TO_SCAN = 3                                         # pgn=1..3
+REQUEST_TIMEOUT = 20
+RETRIES_PER_PAGE = 2
+RETRY_SLEEP = (2, 4)     # случайная пауза между ретраями
+UA_ROTATE = [
+    # пара популярных UA; можно добавить свои
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+]
+
+# Telegram можно подключить позже; сейчас не шлём сообщения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_IDS = [c.strip() for c in os.getenv("CHAT_ID", "").split(",") if c.strip()]
+CHAT_ID = os.getenv("CHAT_ID", "")
 
-CHECK_INTERVAL = 180           # каждые 3 мин
-REPORT_INTERVAL = 1800         # отчёт раз в 30 мин
-ERROR_NOTIFY_INTERVAL = 1800   # уведомлять об ошибках не чаще чем раз в 30 мин
-REQUEST_TIMEOUT = 25
-MAX_PAGES = 3                  # пагинация: до 3 страниц
-RSS_FALLBACK_THRESHOLD = 5     # если HTML дал < 5 объявлений — пробуем RSS
-
-HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# ================== ЛОГИ ==================
+# =============== ЛОГИ ===============
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    force=True,
 )
-log = logging.getLogger("ebay-bot")
+log = logging.getLogger("ebay")
 
-# ================== ГЛОБАЛЬНЫЕ ==================
-scraper = cloudscraper.create_scraper()
-seen_items = {url: set() for url in EBAY_URLS}
-last_error_time = datetime.min
-last_report_time = datetime.now()
-checks_count = 0
-new_items_count = 0
-
-# ================== УТИЛИТЫ ==================
-def _strip_params(url: str, keys_to_drop) -> str:
-    """Убираем из URL указанные GET-параметры (например _stpos, _fcid)."""
+# =============== ВСПОМОГАТЕЛЬНОЕ ===============
+def normalize_search_url(url: str) -> str:
+    """
+    Чистим URL от мусорных параметров и фиксируем нужные (_ipg=240, rt=nc, _pgn=N).
+    Оставляем только «белый список» фильтров eBay.
+    """
+    allowed = {
+        "_nkw", "_sacat", "_dcat", "_udlo", "_udhi", "_stpos", "_fcid", "_sop", "_nqc",
+    }
     u = urlparse(url)
-    q = dict(parse_qsl(u.query, keep_blank_values=True))
-    for k in keys_to_drop:
-        q.pop(k, None)
-    new_q = urlencode(q, doseq=True)
-    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+    params = dict(parse_qsl(u.query, keep_blank_values=True))
 
-def _clean_base_url(url: str) -> str:
-    """Готовим базовый URL поиска: без гео-параметров, с _ipg=240 и rt=nc."""
-    url = _strip_params(url, ["_stpos", "_fcid"])
-    u = urlparse(url)
-    q = dict(parse_qsl(u.query, keep_blank_values=True))
-    q.pop("_pgn", None)
-    q["_ipg"] = "240"
-    q["rt"] = "nc"
-    new_q = urlencode(q, doseq=True)
-    base = urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+    # выбрасываем мусорные параметры
+    cleaned = {k: v for k, v in params.items() if k in allowed}
+
+    # базовые параметры для стабильной выдачи
+    cleaned["_ipg"] = "240"
+    cleaned["rt"] = "nc"
+
+    # собираем обратно (без _pgn)
+    q = urlencode(cleaned, doseq=True)
+    base = urlunparse((u.scheme, u.netloc, u.path, "", q, ""))
     return base
 
-def _extract_item_id(link: str) -> str:
+def make_scraper():
+    # cloudscraper умеет обходить cloudflare/js-челленджи
+    scraper = cloudscraper.create_scraper(
+        browser={
+            "browser": "chrome",
+            "platform": "windows",
+            "desktop": True
+        }
+    )
+    # базовые заголовки
+    headers = {
+        "User-Agent": random.choice(UA_ROTATE),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    scraper.headers.update(headers)
+    return scraper
+
+def fetch_page_html(scraper, url) -> str:
     """
-    Извлекаем стабильный id:
-    1) из query (item id вроде 'mkevt' / 'epid' / 'itm' / 'hash' с item=XXXX);
-    2) из пути /itm/<id>;
-    3) из конца ссылки;
-    4) fallback: сама ссылка целиком.
+    Скачиваем HTML с ретраями. Если 503/403 — меняем UA и ждём.
     """
-    try:
-        # Популярные шаблоны eBay
-        # 1) .../itm/1234567890
-        m = re.search(r"/itm/(\d{8,})", link)
-        if m:
-            return m.group(1)
-
-        # 2) параметр 'item' в query
-        qs = parse_qs(urlsplit(link).query)
-        for key in ("item", "itemid", "itm", "nid"):
-            if key in qs and qs[key]:
-                cand = qs[key][0]
-                if cand.isdigit():
-                    return cand
-
-        # 3) Хвост URL до '?'
-        tail = link.split("?")[0].rstrip("/").split("/")[-1]
-        if tail and any(ch.isalnum() for ch in tail):
-            return tail
-
-    except Exception:
-        pass
-    return link  # самый стабильный fallback — вся ссылка
-
-def _post_telegram(text: str):
-    if not BOT_TOKEN or not CHAT_IDS:
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    for cid in CHAT_IDS:
+    last_err = None
+    for attempt in range(1, RETRIES_PER_PAGE + 1):
         try:
-            r = requests.post(url, data={"chat_id": cid, "text": text}, timeout=15)
-            if r.status_code != 200:
-                log.warning(f"Ошибка Telegram ({cid}): {r.text}")
+            scraper.headers["User-Agent"] = random.choice(UA_ROTATE)
+            r = scraper.get(url, timeout=REQUEST_TIMEOUT)
+            if r.status_code >= 500:
+                raise RuntimeError(f"{r.status_code} Server Error")
+            if r.status_code in (403, 429):
+                raise RuntimeError(f"{r.status_code} Rate/Captcha")
+            return r.text
         except Exception as e:
-            log.warning(f"Сетевая ошибка Telegram ({cid}): {e}")
+            last_err = e
+            log.warning(f"Ошибка HTML на {url} (attempt {attempt}/{RETRIES_PER_PAGE}): {e}")
+            time.sleep(random.uniform(*RETRY_SLEEP))
+    # упало окончательно
+    raise last_err or RuntimeError("Неизвестная ошибка загрузки")
 
-# ================== ПАРСИНГ ==================
-def _parse_json_ld(soup: BeautifulSoup):
-    items = []
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            blob = script.string
-            if not blob:
-                continue
-            data = json.loads(blob)
-            # Вариант списка
-            if isinstance(data, list):
-                for node in data:
-                    items.extend(_items_from_json_node(node))
-            # Вариант словаря
-            elif isinstance(data, dict):
-                items.extend(_items_from_json_node(data))
-        except Exception:
+def parse_items_from_html(html: str):
+    """
+    Парсим карточки из HTML.
+    1) основной селектор: li.s-item
+    2) запасной: div.s-item__wrapper
+    Пытаемся извлечь: id (itemId из ссылки), title, price, link
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # простая проверка на капчу/челлендж
+    text_low = soup.get_text(" ", strip=True).lower()
+    if "verify you're a human" in text_low or "captcha" in text_low:
+        return [], True  # капча
+
+    items = soup.select("li.s-item")
+    if len(items) < 5:
+        # fallback
+        alt = soup.select("div.s-item__wrapper")
+        if len(alt) > len(items):
+            items = alt
+
+    parsed = []
+    for it in items:
+        a = it.select_one("a.s-item__link")
+        title_tag = it.select_one("h3.s-item__title")
+        price_tag = it.select_one(".s-item__price")
+        if not a or not title_tag:
             continue
-    return items
+        link = a.get("href", "").strip()
+        title = title_tag.get_text(strip=True)
 
-def _items_from_json_node(node):
-    items = []
-    # форматы бывают разные: ItemList -> itemListElement[], либо сразу Offer/Products
-    try:
-        if isinstance(node, dict):
-            if "itemListElement" in node:
-                for el in node["itemListElement"]:
-                    product = el.get("item") or el.get("url") or el
-                    rec = _item_from_json_product(product)
-                    if rec:
-                        items.append(rec)
-            else:
-                rec = _item_from_json_product(node)
-                if rec:
-                    items.append(rec)
-    except Exception:
-        pass
-    return items
+        # цена может отсутствовать на части карточек (реклама/витрина)
+        price = price_tag.get_text(strip=True) if price_tag else ""
 
-def _item_from_json_product(prod):
-    try:
-        if isinstance(prod, str):
-            link = prod
-            title = ""
-            price = ""
-        elif isinstance(prod, dict):
-            link = prod.get("url") or prod.get("link") or ""
-            title = prod.get("name") or prod.get("title") or ""
-            offers = prod.get("offers") or {}
-            if isinstance(offers, dict):
-                price = ((offers.get("priceCurrency") or "") + " " + (offers.get("price") or "")).strip()
-            else:
-                price = ""
-        else:
-            return None
+        # вытаскиваем itemId из ссылки (если есть)
+        m = re.search(r"/(\d{9,})\?", link)
+        item_id = m.group(1) if m else link  # fallback — вся ссылка
 
-        if not link:
-            return None
-        item_id = _extract_item_id(link)
-        if not title:
-            # иногда есть "description" вместо имени
-            title = (prod.get("description") or "").strip() if isinstance(prod, dict) else ""
-        title = title[:300]
-        return {"id": item_id, "title": title or "(no title)", "price": price or "", "link": link}
-    except Exception:
-        return None
+        parsed.append({
+            "id": item_id,
+            "title": title,
+            "price": price,
+            "link": link,
+        })
+    return parsed, False
 
-def _parse_html_items(soup: BeautifulSoup):
+# память о уже увиденных ID (на каждую ссылку)
+seen = {}
+
+def crawl_search(url: str):
     """
-    HTML-парсинг: пробуем сразу два варианта селектора,
-    чтобы охватить разные раскладки eBay.
+    Грузим до PAGES_TO_SCAN страниц поисковой выдачи. Если HTML даёт мало карточек,
+    это почти наверняка заглушка/капча — логируем и сохраняем HTML для отладки.
     """
-    items = []
-
-    # Вариант 1: классический список
-    nodes = soup.select("li.s-item")
-    # Вариант 2: иногда eBay вкладывает внутрь .srp-results
-    nodes2 = soup.select(".srp-results .s-item")
-    if len(nodes2) > len(nodes):
-        nodes = nodes2
-
-    for card in nodes:
-        try:
-            # Иногда eBay добавляет "Sponsored", их отфильтровываем
-            badge = card.select_one(".s-item__title--tagblock, .s-item__title--tag")
-            if badge and "sponsored" in badge.get_text(" ").lower():
-                continue
-
-            title_tag = card.select_one(".s-item__title")
-            link_tag = card.select_one("a.s-item__link, a.s-item__title")
-            price_tag = card.select_one(".s-item__price")
-
-            if not link_tag:
-                continue
-
-            link = link_tag.get("href", "").strip()
-            if not link:
-                continue
-
-            title = title_tag.get_text(strip=True) if title_tag else ""
-            price = price_tag.get_text(strip=True) if price_tag else ""
-            item_id = _extract_item_id(link)
-
-            items.append({"id": item_id, "title": title or "(no title)", "price": price, "link": link})
-        except Exception:
-            continue
-
-    return items
-
-def _parse_rss(url: str):
-    items = []
-    rss_url = url + ("&" if ("?" in url) else "?") + "_rss=1"
-    try:
-        resp = scraper.get(rss_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "xml")
-
-        for it in soup.find_all("item"):
-            title = it.title.get_text(strip=True) if it.title else ""
-            link = it.link.get_text(strip=True) if it.link else ""
-            if not link:
-                continue
-            # Цена в description:
-            desc = it.description.get_text(strip=True) if it.description else ""
-            m = re.search(r"\$\s?[\d,]+(?:\.\d+)?", desc)
-            price = m.group(0) if m else ""
-            item_id = _extract_item_id(link)
-            items.append({"id": item_id, "title": title or "(no title)", "price": price, "link": link})
-    except Exception as e:
-        log.warning(f"Ошибка RSS: {e}")
-
-    return items
-
-def fetch_listings(search_url: str):
-    """
-    Комбинация источников:
-      1) JSON-LD
-      2) HTML (.s-item)
-      3) RSS (если HTML дал мало)
-    """
-    base = _clean_base_url(search_url)
+    base = normalize_search_url(url)
     log.info(f"Base URL: {base}")
+    scraper = make_scraper()
 
-    aggregated = []
-    samples_for_log = []  # соберём примеры
+    all_items = []
+    human_check_detected = False
 
-    for p in range(1, MAX_PAGES + 1):
+    for p in range(1, PAGES_TO_SCAN + 1):
         page_url = f"{base}&_pgn={p}"
+        log.info(f"Загружаю страницу {p}/{PAGES_TO_SCAN}: {page_url}")
         try:
-            log.info(f"Загружаю страницу {p}/{MAX_PAGES}: {page_url}")
-            resp = scraper.get(page_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            items = _parse_json_ld(soup)
-            if not items:
-                items = _parse_html_items(soup)
-
-            log.info(f"HTML p={p}: найдено {len(items)}")
-            aggregated.extend(items)
-
-            # соберём примеры для логов (только 3 шт. на страницу)
-            for it in items[:3]:
-                samples_for_log.append(f"• {it['title'][:60]} — {it['price']}")
-
-            # иногда пустая следующая страница — выходим
-            if len(items) == 0 and p > 1:
-                break
+            html = fetch_page_html(scraper, page_url)
         except Exception as e:
             log.warning(f"Ошибка HTML p={p}: {e}")
+            continue
 
-    if aggregated and samples_for_log:
-        log.info("Примеры (первые 3 на каждой странице):\n" + "\n".join(samples_for_log[:9]))
+        items, found_captcha = parse_items_from_html(html)
+        log.info(f"HTML p={p}: найдено {len(items)} карточек")
+        all_items.extend(items)
+        human_check_detected = human_check_detected or found_captcha
 
-    # если HTML дал слишком мало — пробуем RSS
-    if len(aggregated) < RSS_FALLBACK_THRESHOLD:
-        rss_items = _parse_rss(base)
-        log.warning(f"HTML дал мало ({len(aggregated)}) — RSS вернул {len(rss_items)}")
-        aggregated.extend(rss_items)
+        # если карточек совсем мало — сохраним HTML для отладки
+        if len(items) < 5:
+            try:
+                dump_path = f"/opt/render/project/src/ebay_debug_p{p}.html"
+                with open(dump_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                log.warning(f"Сохранён HTML дамп для отладки: {dump_path}")
+            except Exception as e:
+                log.warning(f"Не удалось сохранить дамп HTML: {e}")
 
-    # дедупликация по ID (если ID пустой — по ссылке он уже равен всей ссылке)
+        # небольшая рандомная пауза между страницами
+        time.sleep(random.uniform(1.0, 2.5))
+
+    # Удалим дубликаты по id
     uniq = {}
-    for it in aggregated:
+    for it in all_items:
         uniq[it["id"]] = it
+    all_items = list(uniq.values())
 
-    log.info(f"Итог: собрано {len(uniq)} объявлений (после JSON/HTML + RSS)")
-    return list(uniq.values())
+    if human_check_detected:
+        log.warning("Похоже на защитную страницу (captcha/human check). Кол-во карточек может быть занижено.")
 
-# ================== ОСНОВНОЙ ЦИКЛ ==================
+    log.info(f"Итог: собрано {len(all_items)} объявлений (после чистки дубликатов)")
+    return all_items
+
 def main():
-    global last_report_time, checks_count, new_items_count, last_error_time
-
-    log.info(f"Сервис запущен. Интервал проверок: {CHECK_INTERVAL}s")
-
-    # Инициализация — не уведомляем, просто запоминаем
+    global seen
+    # Инициализация: загружаем текущую выдачу и помечаем как уже виденную
     for url in EBAY_URLS:
         try:
-            items = fetch_listings(url)
-            for it in items:
-                seen_items[url].add(it["id"])
-            log.info(f"Инициализация: сохранено {len(items)} объявлений по {url}")
+            items = crawl_search(url)
+            seen[url] = {it["id"] for it in items}
+            log.info(f"Инициализация: сохранено {len(seen[url])} объявлений по {url}")
         except Exception as e:
-            log.warning(f"Ошибка инициализации {url}: {e}")
+            log.warning(f"Инициализация не удалась для {url}: {e}")
+            seen[url] = set()
 
+    check_num = 0
     while True:
-        checks_count += 1
-        log.info(f"Проверка #{checks_count} начата")
-
+        check_num += 1
+        log.info(f"Проверка #{check_num} начата")
         for url in EBAY_URLS:
             try:
-                items = fetch_listings(url)
-                new_count = 0
-                for it in items:
-                    if it["id"] not in seen_items[url]:
-                        seen_items[url].add(it["id"])
-                        new_items_count += 1
-                        new_count += 1
-                        msg = (
-                            "🆕 Новое объявление на eBay!\n"
-                            f"📌 {it['title']}\n"
-                            f"💲 {it['price']}\n"
-                            f"🔗 {it['link']}"
-                        )
-                        _post_telegram(msg)
-                log.info(f"Получено {len(items)} валидных, новых={new_count} по {url}")
+                items = crawl_search(url)
+                new_items = [it for it in items if it["id"] not in seen[url]]
+                log.info(f"Получено {len(items)} объявлений, новых={len(new_items)} по {url}")
+
+                # Обновляем «увиденные»
+                for it in new_items:
+                    seen[url].add(it["id"])
+
+                # здесь позже можно включить отправку в Telegram
+                # for it in new_items:
+                #     send_telegram_message(f"🆕 {it['title']}\n{it['price']}\n{it['link']}")
+
             except Exception as e:
-                log.warning(f"Ошибка проверки {url}: {e}")
-                if datetime.now() - last_error_time > timedelta(seconds=ERROR_NOTIFY_INTERVAL):
-                    _post_telegram(f"⚠️ Ошибка при проверке {url}: {e}")
-                    last_error_time = datetime.now()
+                log.warning(f"Ошибка проверки для {url}: {e}")
 
-        # отчёт раз в 30 минут
-        if datetime.now() - last_report_time > timedelta(seconds=REPORT_INTERVAL):
-            report = (
-                "📊 Отчёт за 30 минут\n"
-                f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"🔎 Проверок: {checks_count}\n"
-                f"🆕 Новых объявлений: {new_items_count}\n"
-                "✅ Бот работает"
-            )
-            _post_telegram(report)
-            last_report_time = datetime.now()
-            checks_count = 0
-            new_items_count = 0
+            # небольшая пауза между разными ссылками
+            time.sleep(random.uniform(1.0, 2.5))
 
+        # Пауза между циклами
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
+    log.info(f"Сервис запущен. Интервал проверок: {CHECK_INTERVAL}s")
     main()
