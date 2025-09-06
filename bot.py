@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import asyncio
 import logging
 from typing import List, Dict
 from urllib.parse import urlparse
@@ -31,7 +32,7 @@ if not logger.handlers:
     logger.addHandler(_h)
 logger.setLevel(logging.INFO)
 
-TOKEN_ENV = "BOT_TOKEN"  # ИМЯ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ — НЕ МЕНЯЕМ
+TOKEN_ENV = "BOT_TOKEN"  # НЕ МЕНЯЕМ НАЗВАНИЕ
 BOT_TOKEN = os.getenv(TOKEN_ENV)
 if not BOT_TOKEN:
     print(f"Переменная окружения {TOKEN_ENV} не задана", file=sys.stderr)
@@ -75,7 +76,7 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     unsupported = [u for u in links if u not in supported]
     if unsupported:
         await update.message.reply_text(
-            "Пропущены несуппорченные ссылки:\n" + "\n".join(unsupported),
+            "Пропущены не поддерживаемые ссылки:\n" + "\n".join(unsupported),
             disable_web_page_preview=True,
         )
 
@@ -110,7 +111,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
     app.add_error_handler(error_handler)
 
-    app.bot.delete_webhook(drop_pending_updates=True)
+    # асинхронно удалим вебхук ПЕРЕД запуском polling
+    asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
     logger.info("Webhook удалён перед запуском polling.")
 
     try:
