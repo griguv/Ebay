@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import math
 import random
 import logging
 from typing import Dict, List, Optional, Tuple
@@ -22,13 +21,12 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # --------------------------------------
-# Константы стран (только оговорённые)
+# Константы стран (фиксированный набор)
 # --------------------------------------
 COUNTRIES = ["RU", "TR", "KZ", "AE", "HK"]
 
-# ENV с прокси для каждой страны (если есть).
-# Примеры имён переменных:
-# PROXY_RU, PROXY_TR, PROXY_KZ, PROXY_AE, PROXY_HK  -> http(s)://user:pass@host:port
+# ENV с прокси для каждой страны:
+# PROXY_RU/TR/KZ/AE/HK -> http(s)://user:pass@host:port
 PROXIES: Dict[str, Optional[str]] = {
     "RU": os.getenv("PROXY_RU"),
     "TR": os.getenv("PROXY_TR"),
@@ -40,20 +38,17 @@ PROXIES: Dict[str, Optional[str]] = {
 # Таймауты
 REQUEST_TIMEOUT = httpx.Timeout(20.0, connect=20.0, read=20.0)
 
-# Браузерные заголовки (под разные регионы — различаем Accept-Language)
+# Заголовки
 UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
 ]
 
 ACCEPT_LANG = {
     "RU": "ru-RU,ru;q=0.9,en;q=0.8",
     "TR": "tr-TR,tr;q=0.9,en;q=0.8",
-    "KZ": "ru-RU,ru;q=0.9,en;q=0.8",  # часто русская локаль ок
+    "KZ": "ru-RU,ru;q=0.9,en;q=0.8",
     "AE": "en-AE,en;q=0.9",
     "HK": "en-HK,en;q=0.9,zh;q=0.8",
 }
@@ -71,33 +66,25 @@ def build_headers(country: str) -> Dict[str, str]:
     h = dict(COMMON_HEADERS_BASE)
     h["User-Agent"] = ua
     h["Accept-Language"] = ACCEPT_LANG.get(country, "en;q=0.9")
-    # Иногда помогает притвориться, что пришли из гугла
     h["Referer"] = "https://www.google.com/"
     return h
 
 # --------------------------------------
-# Утилиты извлечения цены из HTML/JSON
+# Вспомогательные парсеры
 # --------------------------------------
 def _parse_price_from_ld_json(soup: BeautifulSoup) -> Optional[Tuple[float, str]]:
-    """
-    Универсальный парсер JSON-LD: ищем блоки offers->price(+priceCurrency).
-    Возвращает (price, currency) либо None.
-    """
     try:
         for tag in soup.find_all("script", type=lambda t: t and "ld+json" in t):
             if not tag.string:
                 continue
             data = json.loads(tag.string.strip())
-            # Встречается как объект или массив объектов
             candidates = data if isinstance(data, list) else [data]
             for obj in candidates:
                 offers = obj.get("offers")
                 if not offers:
                     continue
-                # offers может быть объектом/списком
                 offers_list = offers if isinstance(offers, list) else [offers]
                 for off in offers_list:
-                    # Некоторые сайты держат цену как строку
                     price_raw = off.get("price") or off.get("lowPrice") or off.get("highPrice")
                     currency = off.get("priceCurrency") or off.get("priceCurrencyCode")
                     if price_raw:
@@ -111,14 +98,8 @@ def _parse_price_from_ld_json(soup: BeautifulSoup) -> Optional[Tuple[float, str]
     return None
 
 def _parse_price_by_regex(text: str) -> Optional[Tuple[float, Optional[str]]]:
-    """
-    Запасной вариант: ищем число (с разделителями) и валюту в кусках JSON / HTML.
-    """
-    # Валюта в виде "USD", "EUR", "GBP", "TRY", "AED", "HKD", "RUB", "KZT"
     cur_re = r"(USD|EUR|GBP|TRY|AED|HKD|RUB|RUR|KZT)"
-    # Число с возможными запятыми и точками
     price_re = r"(\d{1,3}(?:[ ,]\d{3})*(?:[.,]\d{2})?|\d+)"
-    # Популярные пары "currency":"USD","price":1234.56 и наоборот
     patterns = [
         rf'"price"\s*:\s*"{price_re}"\s*(?:,\s*"priceCurrency"\s*:\s*"{cur_re}")?',
         rf'"price"\s*:\s*{price_re}\s*(?:,\s*"priceCurrency"\s*:\s*"{cur_re}")?',
@@ -127,7 +108,6 @@ def _parse_price_by_regex(text: str) -> Optional[Tuple[float, Optional[str]]]:
     for pat in patterns:
         m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
         if m:
-            # Вычисляем, какие группы поймались (зависят от паттерна)
             groups = [g for g in m.groups() if g is not None]
             nums = [g for g in groups if re.fullmatch(price_re, g)]
             curs = [g for g in groups if re.fullmatch(cur_re, g, flags=re.IGNORECASE)]
@@ -137,9 +117,6 @@ def _parse_price_by_regex(text: str) -> Optional[Tuple[float, Optional[str]]]:
                 return p, c
     return None
 
-# --------------------------------------
-# Определение сайта и получение цены
-# --------------------------------------
 def _host(url: str) -> str:
     try:
         return urlparse(url).netloc.lower()
@@ -153,29 +130,11 @@ def _is_yoox(url: str) -> bool:
     h = _host(url)
     return "yoox." in h or "yoox.com" in h
 
-async def _fetch_html(url: str, country: str, client: httpx.AsyncClient, proxy: Optional[str]) -> Optional[str]:
-    headers = build_headers(country)
-    try:
-        # В httpx 0.28 прокси задаётся параметром proxy= на запросе/клиенте.
-        resp = await client.get(url, headers=headers, timeout=REQUEST_TIMEOUT, proxy=proxy, follow_redirects=True)
-        if 200 <= resp.status_code < 300 and resp.text:
-            return resp.text
-        logger.error("HTTP %s на %s (%s)", resp.status_code, url, country)
-        return None
-    except httpx.HTTPError as e:
-        logger.error("HTTP ошибка на %s (%s): %s", url, country, e)
-        return None
-    except Exception as e:
-        logger.error("Иная ошибка на %s (%s): %s", url, country, e)
-        return None
-
 def _parse_price_farfetch(html: str) -> Optional[Tuple[float, Optional[str]]]:
     soup = BeautifulSoup(html, "html.parser")
-    # Пробуем JSON-LD
     ld = _parse_price_from_ld_json(soup)
     if ld:
         return ld
-    # Резерв: meta-теги
     meta_price = soup.find("meta", {"itemprop": "price"})
     meta_curr = soup.find("meta", {"itemprop": "priceCurrency"})
     if meta_price:
@@ -185,7 +144,6 @@ def _parse_price_farfetch(html: str) -> Optional[Tuple[float, Optional[str]]]:
             return price, currency
         except Exception:
             pass
-    # Падаем на регэксп
     return _parse_price_by_regex(html)
 
 def _parse_price_yoox(html: str) -> Optional[Tuple[float, Optional[str]]]:
@@ -193,7 +151,6 @@ def _parse_price_yoox(html: str) -> Optional[Tuple[float, Optional[str]]]:
     ld = _parse_price_from_ld_json(soup)
     if ld:
         return ld
-    # На YOOX часто есть dataLayer с price/currency
     m = re.search(r"dataLayer\s*=\s*(\[[^\]]+\])", html, flags=re.IGNORECASE)
     if m:
         try:
@@ -209,7 +166,6 @@ def _parse_price_yoox(html: str) -> Optional[Tuple[float, Optional[str]]]:
     return _parse_price_by_regex(html)
 
 def _parse_price_generic(html: str) -> Optional[Tuple[float, Optional[str]]]:
-    # На всякий случай — обобщённый путь
     soup = BeautifulSoup(html, "html.parser")
     ld = _parse_price_from_ld_json(soup)
     if ld:
@@ -223,15 +179,32 @@ def parse_price_for_site(url: str, html: str) -> Optional[Tuple[float, Optional[
         return _parse_price_yoox(html)
     return _parse_price_generic(html)
 
+async def _fetch_html(url: str, country: str, client: httpx.AsyncClient, proxy: Optional[str]) -> Optional[str]:
+    headers = build_headers(country)
+    try:
+        resp = await client.get(
+            url,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            proxy=proxy,  # httpx 0.28+: proxy на уровне запроса
+            follow_redirects=True,
+        )
+        if 200 <= resp.status_code < 300 and resp.text:
+            return resp.text
+        logger.error("HTTP %s на %s (%s)", resp.status_code, url, country)
+        return None
+    except httpx.HTTPError as e:
+        logger.error("HTTP ошибка на %s (%s): %s", url, country, e)
+        return None
+    except Exception as e:
+        logger.error("Иная ошибка на %s (%s): %s", url, country, e)
+        return None
+
 # --------------------------------------
 # Публичные функции
 # --------------------------------------
 async def get_price_for_country(url: str, country: str) -> Optional[Tuple[float, Optional[str]]]:
-    """
-    Возвращает (price, currency) для конкретной страны, либо None.
-    """
     proxy = PROXIES.get(country)
-    # Держим один клиент для экономии соединений. Прокси — на уровне запроса.
     async with httpx.AsyncClient(http2=True) as client:
         html = await _fetch_html(url, country, client, proxy)
         if not html:
@@ -239,18 +212,7 @@ async def get_price_for_country(url: str, country: str) -> Optional[Tuple[float,
         return parse_price_for_site(url, html)
 
 async def get_prices_across_countries(url: str) -> Dict[str, Dict[str, Optional[str]]]:
-    """
-    Парсим цену по всем зафиксированным странам.
-    Возвращает словарь вида:
-    {
-      "RU": {"price": "1234.56", "currency": "RUB"},
-      "TR": {"price": "1000.00", "currency": "TRY"},
-      ...
-    }
-    Значения могут быть None, если парсинг не удался.
-    """
     results: Dict[str, Dict[str, Optional[str]]] = {}
-
     async with httpx.AsyncClient(http2=True) as client:
         for country in COUNTRIES:
             proxy = PROXIES.get(country)
@@ -268,15 +230,12 @@ async def get_prices_across_countries(url: str) -> Dict[str, Dict[str, Optional[
             except Exception as e:
                 logger.error("Ошибка парсинга %s: %s", url, e, exc_info=True)
                 results[country] = {"price": None, "currency": None}
-
     return results
 
 def format_prices_table(prices_by_country: Dict[str, Dict[str, Optional[str]]]) -> str:
-    """
-    Упрощённое форматирование для вывода в ТГ.
-    """
     lines: List[str] = []
-    for c in COUNTRIES:
+    order = ["RU", "TR", "KZ", "AE", "HK"]
+    for c in order:
         data = prices_by_country.get(c) or {}
         price = data.get("price")
         curr = data.get("currency")
@@ -285,15 +244,3 @@ def format_prices_table(prices_by_country: Dict[str, Dict[str, Optional[str]]]) 
         else:
             lines.append(f"{c}: —")
     return "\n".join(lines)
-
-def sum_prices(prices_by_country: Dict[str, Dict[str, Optional[str]]]) -> Dict[str, Optional[float]]:
-    """
-    Суммирование по странам (по одинаковой валюте внутри страны).
-    Если у каких-то ссылок валюта в стране различается — суммировать корректно не сможем (возврат None).
-    """
-    totals: Dict[str, Optional[float]] = {}
-    # здесь предполагаем, что вы суммируете в боте по нескольким ссылкам одну и ту же функцию
-    # и внутри страны валюта совпадает; иначе — нужен конвертер/курс.
-    for country in COUNTRIES:
-        totals[country] = 0.0
-    return totals
