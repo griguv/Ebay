@@ -1,111 +1,94 @@
 import os
-import re
 import asyncio
 import logging
-from bs4 import BeautifulSoup
 import httpx
+from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- Логирование ---
+# 🔹 Логирование
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-log = logging.getLogger("price-bot")
+logger = logging.getLogger("price-bot")
 
-# --- Настройки ---
-TOKEN = os.getenv("BOT_TOKEN", "ТОКЕН_ТУТ")  # токен берём из переменной окружения Render
-CHAT_ID = os.getenv("CHAT_ID", "")           # айди чатов через запятую
-PROXY = os.getenv("PROXY")                   # если нужно – задаём в Render
+# 🔹 Конфигурация из переменных окружения
+TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS = os.getenv("CHAT_ID", "").split(",")
+PROXY_URL = os.getenv("PROXY_URL")  # https://ip:port@login:pass
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36"
-}
+if not TOKEN:
+    raise RuntimeError("❌ Не найден BOT_TOKEN в переменных окружения")
 
-# --- HTTP клиент ---
-client_opts = {"headers": HEADERS, "timeout": 20.0}
-if PROXY:
-    client_opts["proxies"] = {"all://": PROXY}
+# 🔹 HTTP клиент с поддержкой прокси
+client_args = {}
+if PROXY_URL:
+    client_args["proxies"] = PROXY_URL
 
-http_client = httpx.AsyncClient(**client_opts)
+client = httpx.AsyncClient(**client_args, timeout=30)
 
-# --- Парсинг цены ---
-def extract_price(soup: BeautifulSoup) -> str | None:
-    """Извлекает цену с разных сайтов."""
-    text = soup.get_text(" ", strip=True)
+# Список отслеживаемых товаров
+PRODUCT_URLS = [
+    "https://www.farfetch.com/us/shopping/women/christopher-esber--item-31310073.aspx?storeid=10047",
+    "https://www.ebay.com/itm/166907886162",
+]
 
-    # Farfetch
-    ff_price = soup.select_one("p[data-tstid='finalPrice']")
-    if ff_price:
-        return ff_price.get_text(strip=True)
-
-    # eBay
-    ebay_price = soup.select_one("#prcIsum, .x-price-approx__price, .x-price-approx")
-    if ebay_price:
-        return ebay_price.get_text(strip=True)
-
-    # OutdoorDogSupply (In stock)
-    if "in stock" in text.lower():
-        return "In stock"
-
-    # Универсальный поиск цифр
-    m = re.search(r"(\d[\d\s.,]*)(?:\$|USD|руб|₽|€)", text)
-    if m:
-        return m.group(0)
-
-    return None
-
-# --- Команды ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Отправь ссылку на товар, я проверю цену.")
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith("http"):
-        await update.message.reply_text("⚠️ Это не ссылка")
-        return
-
+# 🔹 Получение цены с сайта
+async def fetch_price(url: str) -> str:
     try:
-        r = await http_client.get(url, follow_redirects=True)
-        log.info("[DEBUG HTML %s] %s :: %s", r.status_code, url, r.text[:300])
-        soup = BeautifulSoup(r.text, "html.parser")
-        price = extract_price(soup)
-        if price:
-            await update.message.reply_text(f"💰 Цена: {price}")
-        else:
-            await update.message.reply_text("❌ Не удалось найти цену на странице.")
-    except Exception as e:
-        log.error("Ошибка парсинга %s: %s", url, e)
-        await update.message.reply_text("⚠️ Ошибка при загрузке страницы.")
+        resp = await client.get(url)
+        resp.raise_for_status()
+        logger.info("[DEBUG HTML %s] %s :: %s", resp.status_code, url, resp.text[:500])
 
-# --- Основной запуск ---
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Farfetch
+        price = soup.select_one("[data-tstid='priceInfo'] span")
+        if price:
+            return price.get_text(strip=True)
+
+        # eBay
+        ebay_price = soup.select_one("#prcIsum, .x-price-approx__price, .x-price-approx")
+        if ebay_price:
+            return ebay_price.get_text(strip=True)
+
+        return "❓ Цена не найдена"
+    except Exception as e:
+        logger.error("Ошибка при запросе %s: %s", url, e)
+        return f"⚠️ Ошибка: {e}"
+
+# 🔹 Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я бот для отслеживания цен 🛒")
+
+# 🔹 Проверка цен и отправка в Telegram
+async def check_prices(app: Application):
+    while True:
+        for url in PRODUCT_URLS:
+            price = await fetch_price(url)
+            text = f"🔗 {url}\n💰 {price}"
+            for chat_id in CHAT_IDS:
+                if chat_id.strip():
+                    try:
+                        await app.bot.send_message(chat_id=chat_id.strip(), text=text)
+                    except Exception as e:
+                        logger.error("Ошибка отправки в чат %s: %s", chat_id, e)
+        await asyncio.sleep(300)  # каждые 5 минут
+
+# 🔹 Основной запуск
 async def main():
     app = Application.builder().token(TOKEN).build()
 
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=False)
-        log.info("Webhook удалён перед запуском polling.")
-    except Exception:
-        pass
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
-    # Последовательность для PTB 21
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    # Убираем вебхук и запускаем polling
+    await app.bot.delete_webhook()
+    logger.info("Webhook удалён перед запуском polling.")
 
-    # Заменено .wait() на .idle()
-    await app.updater.idle()
+    # Запускаем задачу проверки цен
+    asyncio.create_task(check_prices(app))
 
-    await app.stop()
-    await app.shutdown()
-    await http_client.aclose()
-    log.info("HTTP session closed.")
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
