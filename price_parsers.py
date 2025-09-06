@@ -213,7 +213,7 @@ async def get_price_for_country(url: str, country: str) -> Optional[Tuple[float,
 
 async def get_prices_across_countries(url: str) -> Dict[str, Dict[str, Optional[str]]]:
     results: Dict[str, Dict[str, Optional[str]]] = {}
-    async with httpx.AsyncClient(http2=True) as client:
+    async with httpx.AsyncClient() as client:
         for country in COUNTRIES:
             proxy = PROXIES.get(country)
             try:
