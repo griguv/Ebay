@@ -32,7 +32,7 @@ if not logger.handlers:
     logger.addHandler(_h)
 logger.setLevel(logging.INFO)
 
-TOKEN_ENV = "БОТ_ТОКЕН"  # ИМЯ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ — НЕ МЕНЯЕМ
+TOKEN_ENV = "BOT_TOKEN"  # ИМЯ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ — НЕ МЕНЯЕМ
 BOT_TOKEN = os.getenv(TOKEN_ENV)
 if not BOT_TOKEN:
     print(f"Переменная окружения {TOKEN_ENV} не задана", file=sys.stderr)
