@@ -1,32 +1,47 @@
 services:
-  - type: web
+  - type: worker
     name: price-bot
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: >
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY
+      pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
+      # Обязательные
+      - key: BOT_TOKEN
         sync: false
       - key: TELEGRAM_USER_ID
         sync: false
+
+      # Прокси (доступны только на рантайме — в UI Render снимите галочку "Available during build")
       - key: HTTP_PROXY
         sync: false
       - key: HTTPS_PROXY
         sync: false
+      - key: FARFETCH_PROXY
+        sync: false
+      - key: YOOX_PROXY
+        sync: false
+
+      # Настройки по умолчанию
       - key: DEFAULT_COUNTRIES
         value: us,de,fr,it,es,uk,hk,kz
       - key: DEFAULT_BASE_CCY
         value: USD
+
+      # Тайминги/стабильность
       - key: GLOBAL_DELAY_MIN
         value: "6.0"
       - key: GLOBAL_DELAY_MAX
         value: "12.0"
-      - key: DEBUG_HTML
-        value: "0"
-      - key: DEBUG_HTML_LEN
-        value: "800"
       - key: COOLDOWN_SECONDS
         value: "120"
       - key: REQUEST_TIMEOUT
         value: "35"
+
+      # Отладка (по желанию)
+      - key: DEBUG_HTML
+        value: "0"
+      - key: DEBUG_HTML_LEN
+        value: "800"
