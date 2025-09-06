@@ -1,4 +1,3 @@
-# price_parsers.py
 import os
 import re
 import json
@@ -69,7 +68,7 @@ def _build_client(country: str) -> httpx.AsyncClient:
     if proxy:
         logger.info("Использую прокси для %s из %s", country, PROXY_ENV[country])
 
-    # <-- ключевое: прокси через транспорт
+    # Прокси — через транспорт; никаких 'proxies='/'proxy='
     transport = httpx.AsyncHTTPTransport(proxy=proxy) if proxy else httpx.AsyncHTTPTransport()
 
     return httpx.AsyncClient(
