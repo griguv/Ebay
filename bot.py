@@ -32,10 +32,10 @@ if not logger.handlers:
     logger.addHandler(_h)
 logger.setLevel(logging.INFO)
 
-TOKEN_ENV = "BOT_TOKEN"  # НЕ МЕНЯЕМ НАЗВАНИЕ
+TOKEN_ENV = "BOT_TOKEN"  # имя переменной окружения — НЕ МЕНЯЕМ
 BOT_TOKEN = os.getenv(TOKEN_ENV)
 if not BOT_TOKEN:
-    print(f"Переменная окружения {TOKEN_ENV} не задана", file=sys.stderr)
+    print(f"Environment variable {TOKEN_ENV} is not set", file=sys.stderr)
     sys.exit(1)
 
 # -----------------------------
@@ -59,8 +59,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         "Отправь ссылку (или несколько через пробел/новую строку) на товар Farfetch или YOOX.\n\n"
         "Бот спарсит цену по странам: RU, TR, KZ, AE, HK, ES и выведет таблицу.\n"
-        "Если ссылок несколько, бот пройдётся по каждой и покажет блоки по ссылкам.\n\n"
-        "_Подсказка_: капчи обходим заголовками и (при необходимости) прокси. "
+        "Если ссылок несколько — выведет блок по каждой ссылке.\n\n"
+        "_Примечание_: капчи обходим заголовками и (при необходимости) прокси. "
         "Для прокси можно задать переменные PROXY_RU/TR/KZ/AE/HK/ES."
     )
     await update.message.reply_text(msg, disable_web_page_preview=True)
@@ -76,7 +76,7 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     unsupported = [u for u in links if u not in supported]
     if unsupported:
         await update.message.reply_text(
-            "Пропущены не поддерживаемые ссылки:\n" + "\n".join(unsupported),
+            "Пропущены неподдерживаемые ссылки:\n" + "\n".join(unsupported),
             disable_web_page_preview=True,
         )
 
@@ -105,28 +105,35 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # MAIN
 # -----------------------------
 def main() -> None:
+    # 1) Создаём приложение
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # 2) Навешиваем хендлеры
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
     app.add_error_handler(error_handler)
 
-    # асинхронно удалим вебхук ПЕРЕД запуском polling
-    asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
+    # 3) ВАЖНО: создаём и назначаем event loop (Python 3.13 сам его не создаёт)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # 4) Удаляем вебхук перед polling и чистим очередь обновлений
+    loop.run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
     logger.info("Webhook удалён перед запуском polling.")
 
     try:
-        # один-единственный polling-процесс
+        # 5) Запускаем СИНХРОННЫЙ run_polling (без await)
         app.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            close_loop=False,   # не трогаем глобальный loop (Render)
-            stop_signals=None,  # Render сам управляет сигналами
+            stop_signals=None,            # Render сам рулит сигналами
+            close_loop=False,             # не закрываем общий loop
             drop_pending_updates=True,
         )
     except Conflict as e:
         logger.error("Конфликт polling: %s. Похоже, уже запущен другой инстанс.", e)
+        # мягко завершаем, чтобы Render не перезапускал бесконечно
         try:
-            app.shutdown()
+            loop.run_until_complete(app.shutdown())
         finally:
             sys.exit(0)
 
