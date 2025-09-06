@@ -1,261 +1,252 @@
 # bot.py
 import asyncio
+import json
 import logging
 import os
-import random
 import re
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from typing import Optional, Tuple
 
 import httpx
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---------- ЛОГИ ----------
-
+# ----------------------- ЛОГГИРОВАНИЕ -----------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("price-bot")
 
-# ---------- НАСТРОЙКИ И ОКРУЖЕНИЕ ----------
+# ----------------------- ENV -----------------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN or BOT_TOKEN in environment")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN (или BOT_TOKEN) в переменных окружения")
-
-ADMIN_ID = os.getenv("TELEGRAM_USER_ID")
-
+ALLOWED_USER_ID = os.getenv("TELEGRAM_USER_ID")  # необязательно
 DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
-DEBUG_HTML_LEN = int(os.getenv("DEBUG_HTML_LEN", "1200"))
+try:
+    DEBUG_HTML_LEN = int(os.getenv("DEBUG_HTML_LEN", "1800"))
+except Exception:
+    DEBUG_HTML_LEN = 1800
 
-# Прокси для httpx (используются и при билде, и в рантайме)
-HTTP_PROXY = os.getenv("HTTP_PROXY")
-HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTPS_PROXY".lower())  # на всякий
+# Прокси оставляю как есть (используем системные переменные).
+HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
 
-PROXIES = {}
-if HTTP_PROXY:
-    PROXIES["http://"] = HTTP_PROXY
-if HTTPS_PROXY:
-    PROXIES["https://"] = HTTPS_PROXY
-
-# Пул реальных UA + ротация языка
-UA_POOL = [
-    # Chrome Win
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
-    # Chrome Mac
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.1 Safari/537.36",
-    # Firefox
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    # Safari
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-]
-
-LANG_POOL = [
-    "en-US,en;q=0.9",
-    "de-DE,de;q=0.9,en;q=0.8",
-    "fr-FR,fr;q=0.9,en;q=0.8",
-    "it-IT,it;q=0.9,en;q=0.8",
-]
-
-# Для Farfetch – альтернативные storeid'ы
-FARFETCH_STOREIDS = ["10047", "10039", "10035", "10037"]  # US, DE, FR, IT и т.п.
-
-# ---------- УТИЛИТЫ URL/FARFETCH ----------
-
-FARFETCH_CC_RE = re.compile(r"/(us|de|fr|it)/", re.IGNORECASE)
-
-def _rotate_farfetch_region(url: str) -> list[str]:
-    """
-    Вернёт список альтернативных URL Farfetch с ротацией страны.
-    Пример: /us/ -> /de/ -> /fr/ -> /it/ -> без кода страны.
-    """
-    if "farfetch.com" not in url:
-        return []
-
-    candidates = []
-    m = FARFETCH_CC_RE.search(url)
-    variants = ["us", "de", "fr", "it"]
-
-    if m:
-        current = m.group(1).lower()
-        order = [cc for cc in variants if cc != current] + [""]
-        for cc in order:
-            if cc:
-                candidates.append(FARFETCH_CC_RE.sub(f"/{cc}/", url, count=1))
-            else:
-                # убрать код страны совсем
-                candidates.append(FARFETCH_CC_RE.sub("/", url, count=1))
-    else:
-        # если кода страны нет — попробуем добавить разные
-        for cc in variants:
-            candidates.append(url.replace("farfetch.com/", f"farfetch.com/{cc}/", 1))
-
-    return candidates
-
-
-def _rotate_farfetch_storeid(url: str) -> list[str]:
-    """
-    Вернёт список URL с разными storeid.
-    Если storeid уже есть — переставим на другой; если нет — добавим.
-    """
-    if "farfetch.com" not in url:
-        return []
-
-    u = urlparse(url)
-    q = dict(parse_qsl(u.query, keep_blank_values=True))
-    current = q.get("storeid")
-    ids = FARFETCH_STOREIDS.copy()
-    random.shuffle(ids)
-
-    cand = []
-    if current:
-        ids = [x for x in ids if x != current] + [current]
-    for sid in ids:
-        q["storeid"] = sid
-        cand.append(urlunparse(u._replace(query=urlencode(q))))
-    return cand
-
-
-def _referer_for(url: str) -> str:
-    p = urlparse(url)
-    return f"{p.scheme}://{p.netloc}/"
-
-# ---------- HTTP КЛИЕНТ ----------
-
-def _headers_for(url: str) -> dict:
-    return {
-        "User-Agent": random.choice(UA_POOL),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": random.choice(LANG_POOL),
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": _referer_for(url),
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+PROXIES = None
+if HTTP_PROXY or HTTPS_PROXY:
+    PROXIES = {
+        "http://": HTTP_PROXY or HTTPS_PROXY,
+        "https://": HTTPS_PROXY or HTTP_PROXY,
     }
 
-def _is_retryable(status: int) -> bool:
-    # 403/429 — часто антибот; 5xx — нестабильность
-    return status in (403, 429) or 500 <= status < 600
+# Таймауты HTTP
+TIMEOUT = httpx.Timeout(25.0, connect=25.0, read=25.0)
 
-async def fetch_html(url: str, client: httpx.AsyncClient, max_retries: int = 4, timeout: float = 30.0) -> tuple[int, str]:
-    """
-    Возвращает (status_code, text). Делает ретраи с бэкоффом, меняя заголовки,
-    при Farfetch пробует альтернативные регионы и storeid.
-    """
-    # Очередь кандидатов: исходный URL + возможные варианты для Farfetch
-    queue: list[str] = [url]
-    if "farfetch.com" in url:
-        # чередуем region и storeid, чтобы увеличить шанс прохода
-        queue += _rotate_farfetch_region(url)[:3]
-        queue += _rotate_farfetch_storeid(url)[:3]
 
-    tried = set()
-    attempt = 0
-    last_exc: Exception | None = None
+# ======================= ПАРСИНГ ЦЕН =======================
 
-    while queue and attempt < max_retries:
-        current_url = queue.pop(0)
-        if current_url in tried:
-            continue
-        tried.add(current_url)
-        attempt += 1
-
-        headers = _headers_for(current_url)
-
-        try:
-            r = await client.get(current_url, headers=headers, timeout=timeout)
-            status = r.status_code
-            text = r.text
-
-            if DEBUG_HTML:
-                # Логируем срез HTML, чтобы не заливать логи
-                short = text[:DEBUG_HTML_LEN].replace("\n", "")
-                log.info("[DEBUG HTML %s] %s :: %s", status, current_url, short)
-
-            if _is_retryable(status) and attempt < max_retries:
-                # Эвристика: если это farfetch и есть ещё варианты — подкинем их в хвост
-                if "farfetch.com" in current_url:
-                    queue += _rotate_farfetch_region(current_url)[:2]
-                    queue += _rotate_farfetch_storeid(current_url)[:2]
-                # Бэкофф 0.6..1.2 * 2^(attempt-1)
-                delay = (0.6 + random.random() * 0.6) * (2 ** (attempt - 1))
-                await asyncio.sleep(delay)
-                continue
-
-            return status, text
-
-        except httpx.HTTPError as e:
-            last_exc = e
-            if attempt < max_retries:
-                delay = (0.6 + random.random() * 0.6) * (2 ** (attempt - 1))
-                await asyncio.sleep(delay)
-                continue
-            raise
-
-    # Если сюда дошли — либо пустая очередь, либо исчерпали попытки
-    if last_exc:
-        raise last_exc
-    return 520, ""  # "неопределённая" сетевой сбой
-
-# ---------- TELEGRAM-ХЕНДЛЕРЫ ----------
-
-URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-
-async def start(update, context):
-    msg = (
-        "Привет! Пришлите ссылку — я попробую получить HTML.\n\n"
-        "Заголовки и язык ротуются, есть ретраи при 403/429/5xx.\n"
-        "Прокси берётся из переменных HTTP_PROXY / HTTPS_PROXY."
+def _meta_price(soup: BeautifulSoup) -> Optional[Tuple[str, str]]:
+    """Ищем price через meta itemprop."""
+    price_tag = soup.find("meta", {"itemprop": "price"})
+    curr_tag = soup.find("meta", {"itemprop": "priceCurrency"})
+    if price_tag and curr_tag and price_tag.get("content"):
+        return price_tag["content"].strip(), curr_tag.get("content", "").strip()
+    # альтернатива: og:price / product:price
+    og_price = soup.find("meta", {"property": "product:price:amount"}) or soup.find(
+        "meta", {"property": "og:price:amount"}
     )
-    await update.message.reply_text(msg)
+    og_curr = soup.find("meta", {"property": "product:price:currency"}) or soup.find(
+        "meta", {"property": "og:price:currency"}
+    )
+    if og_price and og_curr and og_price.get("content"):
+        return og_price["content"].strip(), og_curr.get("content", "").strip()
+    return None
 
-async def handle_text(update, context):
+
+def _farfetch_next_data(soup: BeautifulSoup) -> Optional[Tuple[str, str]]:
+    """Парсим цену из __NEXT_DATA__ на Farfetch."""
+    script = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not script or not script.string:
+        return None
+    try:
+        data = json.loads(script.string)
+        # Встречающиеся структуры:
+        # props.pageProps.product.price.{value,currency}
+        # props.pageProps.product.prices.{price,finalPrice,currency}
+        pp = data.get("props", {}).get("pageProps", {})
+        product = pp.get("product", {}) or pp.get("productData", {}) or {}
+        # вариант 1
+        p1 = product.get("price") or {}
+        if isinstance(p1, dict) and ("value" in p1 or "amount" in p1):
+            value = p1.get("value") or p1.get("amount")
+            curr = p1.get("currency") or p1.get("currencyCode")
+            if value and curr:
+                return str(value), str(curr)
+        # вариант 2
+        p2 = product.get("prices") or {}
+        if isinstance(p2, dict):
+            value = p2.get("finalPrice") or p2.get("price")
+            curr = p2.get("currency") or p2.get("currencyCode")
+            if value and curr:
+                return str(value), str(curr)
+    except Exception:
+        return None
+    return None
+
+
+def _fallback_guess(html: str) -> Optional[str]:
+    """Грубый резервный поиск: 123.45 USD/€/$ или символ перед/после числа."""
+    # $ 1,234.56 / € 1.234,56 / 1234 USD / 1 234,56 EUR
+    pattern = r"(?:(?:USD|EUR|GBP|RUB|UAH|PLN|KZT|CHF|CAD|AUD)\b|[$€£₽₴zł₸])\s*[\d\s.,]+|[\d\s.,]+\s*(?:USD|EUR|GBP|RUB|UAH|PLN|KZT|CHF|CAD|AUD)\b"
+    m = re.search(pattern, html, re.IGNORECASE)
+    if m:
+        return m.group(0).strip()
+    return None
+
+
+def extract_price(html: str, url: str) -> Optional[str]:
+    """Единая точка извлечения цены из HTML. Возвращает строку '123 EUR' или '$123'."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) meta-признаки (универсальный безопасный путь)
+    meta = _meta_price(soup)
+    if meta:
+        value, curr = meta
+        if value and curr:
+            return f"{value} {curr}"
+
+    # 2) Farfetch: JSON __NEXT_DATA__
+    if "farfetch.com" in url:
+        ff = _farfetch_next_data(soup)
+        if ff:
+            value, curr = ff
+            return f"{value} {curr}"
+
+    # 3) Схемы schema.org (на всякий случай)
+    #   <span itemprop="price" content="...">, <meta itemprop="priceCurrency" ...>
+    span_price = soup.find(attrs={"itemprop": "price"})
+    span_curr = soup.find(attrs={"itemprop": "priceCurrency"})
+    if span_price:
+        pv = (span_price.get("content") or span_price.get_text(strip=True) or "").strip()
+        cv = ""
+        if span_curr:
+            cv = (span_curr.get("content") or span_curr.get_text(strip=True) or "").strip()
+        if pv and cv:
+            return f"{pv} {cv}"
+        if pv:
+            return pv
+
+    # 4) Fallback – эвристика по тексту страницы
+    rough = _fallback_guess(html)
+    if rough:
+        return rough
+
+    return None
+
+
+# ======================= HTTP =======================
+
+async def fetch_html(url: str) -> Tuple[str, int]:
+    headers = {
+        # максимально нейтральный UA
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async with httpx.AsyncClient(proxies=PROXIES, timeout=TIMEOUT, follow_redirects=True, headers=headers) as client:
+        r = await client.get(url)
+        status = r.status_code
+        html = r.text
+
+        if DEBUG_HTML:
+            sample = html[:DEBUG_HTML_LEN].replace("\n", "")
+            log.info("[DEBUG HTML %s] %s :: %s", status, url, sample)
+
+        return html, status
+
+
+# ======================= TELEGRAM HANDLERS =======================
+
+def _ensure_allowed(update: Update) -> bool:
+    """Пускаем только заданного user_id (если он указан)."""
+    if not ALLOWED_USER_ID:
+        return True
+    try:
+        return str(update.effective_user.id) == str(ALLOWED_USER_ID)
+    except Exception:
+        return False
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _ensure_allowed(update):
+        return
+    await update.message.reply_text("Пришлите ссылку на товар — отвечу ценой.")
+
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _ensure_allowed(update):
+        return
     text = (update.message.text or "").strip()
-    m = URL_RE.search(text)
+
+    # Берём первую ссылку из сообщения
+    m = re.search(r"https?://\S+", text)
     if not m:
-        await update.message.reply_text("Пришлите URL (http/https).")
+        await update.message.reply_text("Не вижу ссылки. Пришлите URL на страницу товара.")
         return
 
     url = m.group(0)
 
-    # Каждый апдейт — свежая сессия httpx, чтобы не утыкаться в кэш
-    limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
-    async with httpx.AsyncClient(proxies=PROXIES or None, follow_redirects=True, limits=limits) as client:
-        try:
-            status, html = await fetch_html(url, client)
-        except Exception as e:
-            log.exception("fetch failed")
-            await update.message.reply_text(f"Запрос упал: {type(e).__name__}: {e}")
-            return
+    try:
+        html, status = await fetch_html(url)
+    except Exception as e:
+        log.exception("fetch failed")
+        await update.message.reply_text(f"Ошибка загрузки страницы: {e}")
+        return
 
-    # Короткий отчёт в TG
-    length = len(html)
-    preview = html[:400].replace("\n", " ") if html else ""
-    reply = f"HTTP {status}, bytes={length}\n\n{preview}"
-    await update.message.reply_text(reply or f"HTTP {status}")
+    if status >= 400:
+        await update.message.reply_text(f"HTTP {status} при загрузке страницы.")
+        return
 
-# ---------- MAIN ----------
+    price = extract_price(html, url)
+    if price:
+        await update.message.reply_html(f"💸 <b>Цена:</b> <code>{price}</code>\n🔗 <a href=\"{url}\">страница</a>")
+    else:
+        await update.message.reply_text("Не удалось найти цену 😔. Включи DEBUG_HTML_LEN побольше и пришли лог — допилю селектор.")
 
-async def on_startup(app: Application):
-    # Гарантированно уберём вебхук перед polling, чтобы исключить 409
-    from telegram import Bot
-    bot = Bot(BOT_TOKEN)
-    await bot.delete_webhook(drop_pending_updates=False)
-    log.info("Webhook удалён перед запуском polling.")
 
-def main():
-    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+# ======================= MAIN =======================
+
+async def main():
+    # Старт Telegram
+    app = Application.builder().token(TOKEN).build()
+
+    # Снимем webhook (на всякий случай)
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=False)
+        log.info("Webhook удалён перед запуском polling.")
+    except Exception:
+        pass
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
-    app.post_init = on_startup
+    # run_polling сам создаёт event loop, но мы уже в async main → используем start/idle
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await app.updater.wait()
+    await app.stop()
+    log.info("HTTP session closed.")
 
-    # Стартуем polling
-    log.info("Application starting…")
-    app.run_polling(allowed_updates=["message"], stop_signals=None)  # без сигналов, как у Render
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
