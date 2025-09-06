@@ -3,6 +3,7 @@ import re
 import json
 import math
 import html
+import time
 import random
 import logging
 import asyncio
@@ -14,21 +15,41 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # -------------------------------
+# LOGGING
+# -------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("price-bot")
+
+# -------------------------------
 # CONFIG
 # -------------------------------
-# Токен встроен по просьбе владельца. Для безопасности можно задать TELEGRAM_BOT_TOKEN в окружении.
-TOKEN = "7950356051:AAEpLiWpGFUwj38b6AyUJcjYYmauUrmLuAU"
-OWNER_ID = 200156484  # только этот пользователь может пользоваться ботом. Поставь None для всех
+# Токен: сначала из окружения, иначе — дефолт (можешь заменить на свой при желании)
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7950356051:AAEpLiWpGFUwj38b6AyUJcjYYmauUrmLuAU")
+# Разрешённый пользователь (твоя учётка). Поставь None, чтобы разрешить всем.
+OWNER_ID = int(os.getenv("TELEGRAM_USER_ID", "200156484"))
 
 DEFAULT_COUNTRIES = ["us", "de", "fr", "it", "es", "uk", "hk", "kz"]
 DEFAULT_BASE_CCY = "USD"
-REQUEST_TIMEOUT = 30
-PAUSE_BETWEEN_REQUESTS = (2.5, 4.0)  # стало «бережнее»
-MAX_RETRIES = 2
 
-# включить лог первых символов HTML в Render-логах через переменные окружения
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+
+# «Бережные» паузы между запросами; Farfetch дополнительно замедляем (см. ниже)
+PAUSE_BETWEEN_REQUESTS = (3.5, 6.5)
+
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
+
+# DEBUG HTML в логах
 DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
 DEBUG_HTML_LEN = int(os.getenv("DEBUG_HTML_LEN", "1200"))
+
+# Прокси
+GLOBAL_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("ALL_PROXY")
+FARFETCH_PROXY = os.getenv("FARFETCH_PROXY")
+YOOX_PROXY = os.getenv("YOOX_PROXY")
+
+# Доменные cooldown’ы (после 403/капчи)
+DOMAIN_COOLDOWN = {"farfetch.com": 0.0, "yoox.com": 0.0}
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "90"))
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
@@ -37,9 +58,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile Safari/604.1",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
 ]
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("price-bot")
 
 # -------------------------------
 # HELPERS
@@ -86,40 +104,65 @@ def set_country_in_url(url: str, country: str, domain: str) -> str:
 def pick_headers(country: str | None = None) -> dict:
     # Небольшая локализация Accept-Language под страну
     lang_map = {
-        "it": "it-IT,it;q=0.9",
-        "de": "de-DE,de;q=0.9",
-        "fr": "fr-FR,fr;q=0.9",
-        "es": "es-ES,es;q=0.9",
-        "uk": "en-GB,en;q=0.9",
-        "us": "en-US,en;q=0.9",
-        "hk": "zh-HK,zh;q=0.8,en;q=0.7",
-        "kz": "ru-RU,ru;q=0.9,en;q=0.7",
+        "it": "it-IT,it;q=0.9", "de": "de-DE,de;q=0.9", "fr": "fr-FR,fr;q=0.9",
+        "es": "es-ES,es;q=0.9", "uk": "en-GB,en;q=0.9", "us": "en-US,en;q=0.9",
+        "hk": "zh-HK,zh;q=0.8,en;q=0.7", "kz": "ru-RU,ru;q=0.9,en;q=0.7",
     }
     al = lang_map.get((country or "").lower(), "en-US,en;q=0.8")
+    ua = random.choice(USER_AGENTS)
     return {
-        "User-Agent": random.choice(USER_AGENTS),
+        "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": al,
+        "Accept-Encoding": "gzip, deflate, br",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-User": "?1",
+        "Sec-Fetch-Dest": "document",
         "Connection": "close",
     }
 
+def pick_proxy_for(url: str) -> str | None:
+    host = urlparse(url).netloc.lower()
+    domain = ".".join(host.split(".")[-2:])
+    if domain == "farfetch.com" and FARFETCH_PROXY:
+        return FARFETCH_PROXY
+    if domain == "yoox.com" and YOOX_PROXY:
+        return YOOX_PROXY
+    return GLOBAL_PROXY
+
 async def gentle_get(session: aiohttp.ClientSession, url: str, country: str | None = None) -> tuple[int|None, str|None]:
+    # Доменный cooldown
+    host = urlparse(url).netloc.lower()
+    domain = ".".join(host.split(".")[-2:])
+    now = time.time()
+    if DOMAIN_COOLDOWN.get(domain, 0) > now:
+        await asyncio.sleep(DOMAIN_COOLDOWN[domain] - now + 0.1)
+
+    proxy = pick_proxy_for(url)
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(url, headers=pick_headers(country), timeout=REQUEST_TIMEOUT) as r:
+            async with session.get(
+                url,
+                headers=pick_headers(country),
+                timeout=REQUEST_TIMEOUT,
+                proxy=proxy,
+            ) as r:
                 status = r.status
                 text = await r.text(errors="ignore")
 
-                # DEBUG: логируем начало HTML
                 if DEBUG_HTML and text:
                     head = text[:DEBUG_HTML_LEN].replace("\n", " ")[:DEBUG_HTML_LEN]
                     logger.info(f"[DEBUG HTML {status}] {url} :: {head}")
 
-                # частые признаки блокировок/капчи
-                if status in (403, 429) or (text and any(k in text.lower() for k in [
+                blocked = status in (403, 429) or (text and any(k in text.lower() for k in [
                     "captcha", "access denied", "temporarily unavailable",
                     "cloudflare", "akamai", "bot detection"
-                ])):
+                ]))
+                if blocked:
+                    DOMAIN_COOLDOWN[domain] = time.time() + COOLDOWN_SECONDS
                     await asyncio.sleep(2.0 * attempt)
                     continue
 
@@ -132,7 +175,7 @@ async def gentle_get(session: aiohttp.ClientSession, url: str, country: str | No
             await asyncio.sleep(1.2 * attempt)
     return None, None
 
-# ---- универсальные утилиты для парсинга чисел/валюты
+# ---- числа/валюта
 def _parse_number_localized(s: str) -> float | None:
     if not s:
         return None
@@ -163,7 +206,7 @@ def _guess_ccy(text: str) -> str | None:
 def parse_price_yoox(html_text: str) -> tuple[float|None, str|None]:
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # 1) JSON-LD (dict или список)
+    # JSON-LD
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "{}")
@@ -190,13 +233,13 @@ def parse_price_yoox(html_text: str) -> tuple[float|None, str|None]:
                     if pn is not None:
                         return pn, ccy
 
-    # 2) Внутренние JSON-блоки
+    # Внутренние JSON
     m = re.search(r'"(formattedFinalPrice|finalPrice|price)"\s*:\s*"?(?P<p>[\d.,]+)"?.{0,120}?"(currency|priceCurrency)"\s*:\s*"(?P<c>[A-Z]{3})"', html_text)
     if m:
         pn = _parse_number_localized(m.group("p"))
         return (pn, m.group("c")) if pn is not None else (None, None)
 
-    # 3) Видимые элементы
+    # Видимые элементы
     cand = soup.select_one(".finalPrice, .price, .priceContainer span, [itemprop='price']")
     if cand:
         txt = cand.get_text(" ", strip=True)
@@ -204,7 +247,7 @@ def parse_price_yoox(html_text: str) -> tuple[float|None, str|None]:
         if pn is not None:
             return pn, _guess_ccy(txt)
 
-    # 4) Общий фолбэк
+    # Фолбэк
     txt = soup.get_text(" ", strip=True)
     m2 = re.search(r'(HK\$|[€$£])\s?([\d.,]+)', txt)
     if m2:
@@ -217,7 +260,7 @@ def parse_price_yoox(html_text: str) -> tuple[float|None, str|None]:
 def parse_price_farfetch(html_text: str) -> tuple[float|None, str|None]:
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # 1) JSON-LD
+    # JSON-LD
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "{}")
@@ -244,13 +287,13 @@ def parse_price_farfetch(html_text: str) -> tuple[float|None, str|None]:
                     if pn is not None:
                         return pn, ccy
 
-    # 2) Внутренние JSON из Next.js
+    # Внутренние JSON (Next.js)
     m = re.search(r'"price"\s*:\s*"?(?P<p>[\d.,]+)"?\s*,\s*"(?:currency|priceCurrency)"\s*:\s*"(?P<c>[A-Z]{3})"', html_text)
     if m:
         pn = _parse_number_localized(m.group("p"))
         return (pn, m.group("c")) if pn is not None else (None, None)
 
-    # 3) Видимые селекторы
+    # Видимые селекторы
     cand = soup.select_one('[data-testid="price"], [data-test="price"], ._d85b45, ._e5f6a7, .price')
     if cand:
         txt = cand.get_text(" ", strip=True)
@@ -258,7 +301,7 @@ def parse_price_farfetch(html_text: str) -> tuple[float|None, str|None]:
         if pn is not None:
             return pn, _guess_ccy(txt)
 
-    # 4) Общий фолбэк
+    # Фолбэк
     txt = soup.get_text(" ", strip=True)
     m2 = re.search(r'([€$£]|HK\$)\s?([\d.,]+)', txt)
     if m2:
@@ -271,7 +314,7 @@ async def fetch_rates(base=DEFAULT_BASE_CCY) -> dict[str, float]:
     url = f"https://api.exchangerate.host/latest?base={quote(base)}"
     async with aiohttp.ClientSession() as s:
         try:
-            async with s.get(url, timeout=10) as r:
+            async with s.get(url, timeout=10, proxy=GLOBAL_PROXY) as r:
                 if r.status == 200:
                     data = await r.json()
                     return data.get("rates", {}) or {}
@@ -294,6 +337,7 @@ def convert(amount: float, ccy_from: str, base: str, rates: dict[str, float]) ->
 async def fetch_country_price(session: aiohttp.ClientSession, url: str, domain: str, country: str):
     target_url = set_country_in_url(url, country, domain)
     _, text = await gentle_get(session, target_url, country=country)
+    # Базовая пауза
     await asyncio.sleep(random.uniform(*PAUSE_BETWEEN_REQUESTS))
     if not text:
         return country, None, None, target_url
@@ -327,6 +371,11 @@ async def compare_links(links: list[str], countries: list[str], base_ccy=DEFAULT
                 else:
                     totals[country] += base_price
                 rows.append({"country": country, "price": price, "ccy": ccy, "base_price": base_price, "final_url": final_url})
+
+                # Для Farfetch — дополнительная долгая пауза (минимум 6–10 сек на страну)
+                if domain == "farfetch.com":
+                    await asyncio.sleep(random.uniform(6.0, 10.0))
+
             results.append({"url": url, "rows": rows})
 
     ranking = sorted(countries, key=lambda cc: (math.inf if not ok[cc] else totals[cc]))
@@ -396,7 +445,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("⛔ Доступ ограничен владельцем.")
         return
-    await update.message.reply_text("Привет! Я аккуратно сравниваю цены на YOOX и FARFETCH.\n\n" + HELP_TEXT)
+    msg = "Привет! Я аккуратно сравниваю цены на YOOX и FARFETCH.\n\n" + HELP_TEXT
+    # Показываем, используем ли прокси
+    px = pick_proxy_for("https://www.farfetch.com")
+    gpx = GLOBAL_PROXY
+    if gpx or px:
+        msg += "\n\n🔌 Прокси активен."
+    await update.message.reply_text(msg)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -438,6 +493,7 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пришли ссылки на товары.")
         return
     await update.message.reply_text("Сравниваю цены...")
+
     try:
         results, totals, ok, ranking, base = await compare_links(links, STATE["countries"], STATE["base"])
         table = build_table(results, totals, ok, ranking, base)
@@ -446,15 +502,20 @@ async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("compare_links failed")
         await update.message.reply_text(f"Ошибка: {e}")
 
+# Лаконичный обработчик ошибок, чтобы не сыпались стектрейсы в логах
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error: %s", context.error)
+
 def main():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN") or TOKEN
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(TOKEN).build()
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("set_countries", set_countries))
     app.add_handler(CommandHandler("set_base", set_base))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
-    app.run_polling(close_loop=False)
+    # Не обрабатываем «залежавшиеся» апдейты и не блокируем event loop Render
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 if __name__ == "__main__":
     main()
