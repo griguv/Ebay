@@ -22,9 +22,13 @@ OWNER_ID = 200156484  # только этот пользователь може�
 
 DEFAULT_COUNTRIES = ["us", "de", "fr", "it", "es", "uk", "hk", "kz"]
 DEFAULT_BASE_CCY = "USD"
-REQUEST_TIMEOUT = 22
-PAUSE_BETWEEN_REQUESTS = (1.2, 2.1)
+REQUEST_TIMEOUT = 30
+PAUSE_BETWEEN_REQUESTS = (2.5, 4.0)  # стало «бережнее»
 MAX_RETRIES = 2
+
+# включить лог первых символов HTML в Render-логах через переменные окружения
+DEBUG_HTML = os.getenv("DEBUG_HTML", "0") == "1"
+DEBUG_HTML_LEN = int(os.getenv("DEBUG_HTML_LEN", "1200"))
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
@@ -36,7 +40,6 @@ USER_AGENTS = [
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("price-bot")
-
 
 # -------------------------------
 # HELPERS
@@ -80,74 +83,188 @@ def set_country_in_url(url: str, country: str, domain: str) -> str:
 
     return url
 
-def pick_headers() -> dict:
+def pick_headers(country: str | None = None) -> dict:
+    # Небольшая локализация Accept-Language под страну
+    lang_map = {
+        "it": "it-IT,it;q=0.9",
+        "de": "de-DE,de;q=0.9",
+        "fr": "fr-FR,fr;q=0.9",
+        "es": "es-ES,es;q=0.9",
+        "uk": "en-GB,en;q=0.9",
+        "us": "en-US,en;q=0.9",
+        "hk": "zh-HK,zh;q=0.8,en;q=0.7",
+        "kz": "ru-RU,ru;q=0.9,en;q=0.7",
+    }
+    al = lang_map.get((country or "").lower(), "en-US,en;q=0.8")
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.8",
+        "Accept-Language": al,
         "Connection": "close",
     }
 
-async def gentle_get(session: aiohttp.ClientSession, url: str) -> tuple[int|None, str|None]:
+async def gentle_get(session: aiohttp.ClientSession, url: str, country: str | None = None) -> tuple[int|None, str|None]:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(url, headers=pick_headers(), timeout=REQUEST_TIMEOUT) as r:
+            async with session.get(url, headers=pick_headers(country), timeout=REQUEST_TIMEOUT) as r:
                 status = r.status
                 text = await r.text(errors="ignore")
+
+                # DEBUG: логируем начало HTML
+                if DEBUG_HTML and text:
+                    head = text[:DEBUG_HTML_LEN].replace("\n", " ")[:DEBUG_HTML_LEN]
+                    logger.info(f"[DEBUG HTML {status}] {url} :: {head}")
+
+                # частые признаки блокировок/капчи
+                if status in (403, 429) or (text and any(k in text.lower() for k in [
+                    "captcha", "access denied", "temporarily unavailable",
+                    "cloudflare", "akamai", "bot detection"
+                ])):
+                    await asyncio.sleep(2.0 * attempt)
+                    continue
+
                 if status == 200 and text:
                     return status, text
-                if status in (403, 429):
-                    await asyncio.sleep(2.0 * attempt)
-                else:
-                    await asyncio.sleep(1.0)
-        except Exception:
+
+                await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.warning(f"gentle_get error (attempt {attempt}) on {url}: {e}")
             await asyncio.sleep(1.2 * attempt)
     return None, None
 
+# ---- универсальные утилиты для парсинга чисел/валюты
+def _parse_number_localized(s: str) -> float | None:
+    if not s:
+        return None
+    t = s.replace("\xa0", " ").strip()
+    m = re.search(r'([\d.,]+)', t)
+    if not m:
+        return None
+    num = m.group(1)
+    if "." in num and "," in num:
+        num = num.replace(".", "").replace(",", ".")
+    elif "," in num and "." not in num:
+        num = num.replace(",", ".")
+    try:
+        return float(num)
+    except Exception:
+        return None
+
+def _guess_ccy(text: str) -> str | None:
+    up = (text or "").upper()
+    if "€" in up or "EUR" in up: return "EUR"
+    if "£" in up or "GBP" in up: return "GBP"
+    if "HK$" in up or "HKD" in up: return "HKD"
+    if "$" in up or "USD" in up:  return "USD"
+    m = re.search(r'\b([A-Z]{3})\b', up)
+    return m.group(1) if m else None
+
+# ---- YOOX
 def parse_price_yoox(html_text: str) -> tuple[float|None, str|None]:
     soup = BeautifulSoup(html_text, "html.parser")
+
+    # 1) JSON-LD (dict или список)
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "{}")
-            if isinstance(data, dict):
-                offers = data.get("offers")
-                if isinstance(offers, dict):
-                    price = offers.get("price")
-                    ccy = offers.get("priceCurrency")
-                    if price:
-                        return float(str(price).replace(",", "").strip()), ccy
         except Exception:
-            pass
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r'([€$£])\s?([\d.,]+)', text)
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            offers = node.get("offers")
+            if isinstance(offers, dict):
+                price = offers.get("price") or offers.get("lowPrice")
+                ccy = offers.get("priceCurrency")
+                if price:
+                    pn = _parse_number_localized(str(price))
+                    if pn is not None:
+                        return pn, ccy
+            ps = node.get("priceSpecification")
+            if isinstance(ps, dict):
+                price = ps.get("price")
+                ccy = ps.get("priceCurrency")
+                if price:
+                    pn = _parse_number_localized(str(price))
+                    if pn is not None:
+                        return pn, ccy
+
+    # 2) Внутренние JSON-блоки
+    m = re.search(r'"(formattedFinalPrice|finalPrice|price)"\s*:\s*"?(?P<p>[\d.,]+)"?.{0,120}?"(currency|priceCurrency)"\s*:\s*"(?P<c>[A-Z]{3})"', html_text)
     if m:
-        sym = m.group(1)
-        amt = float(m.group(2).replace(",", ""))
-        ccy_map = {"€": "EUR", "$": "USD", "£": "GBP"}
-        return amt, ccy_map.get(sym)
+        pn = _parse_number_localized(m.group("p"))
+        return (pn, m.group("c")) if pn is not None else (None, None)
+
+    # 3) Видимые элементы
+    cand = soup.select_one(".finalPrice, .price, .priceContainer span, [itemprop='price']")
+    if cand:
+        txt = cand.get_text(" ", strip=True)
+        pn = _parse_number_localized(txt)
+        if pn is not None:
+            return pn, _guess_ccy(txt)
+
+    # 4) Общий фолбэк
+    txt = soup.get_text(" ", strip=True)
+    m2 = re.search(r'(HK\$|[€$£])\s?([\d.,]+)', txt)
+    if m2:
+        pn = _parse_number_localized(m2.group(0))
+        return pn, _guess_ccy(m2.group(0))
+
     return None, None
 
+# ---- FARFETCH
 def parse_price_farfetch(html_text: str) -> tuple[float|None, str|None]:
     soup = BeautifulSoup(html_text, "html.parser")
+
+    # 1) JSON-LD
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "{}")
-            if isinstance(data, dict):
-                offers = data.get("offers")
-                if isinstance(offers, dict):
-                    price = offers.get("price")
-                    ccy = offers.get("priceCurrency")
-                    if price:
-                        return float(str(price).replace(",", "").strip()), ccy
         except Exception:
-            pass
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r'([€$£])\s?([\d.,]+)', text)
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            offers = node.get("offers")
+            if isinstance(offers, dict):
+                price = offers.get("price") or offers.get("lowPrice")
+                ccy = offers.get("priceCurrency")
+                if price:
+                    pn = _parse_number_localized(str(price))
+                    if pn is not None:
+                        return pn, ccy
+            ps = node.get("priceSpecification")
+            if isinstance(ps, dict):
+                price = ps.get("price")
+                ccy = ps.get("priceCurrency")
+                if price:
+                    pn = _parse_number_localized(str(price))
+                    if pn is not None:
+                        return pn, ccy
+
+    # 2) Внутренние JSON из Next.js
+    m = re.search(r'"price"\s*:\s*"?(?P<p>[\d.,]+)"?\s*,\s*"(?:currency|priceCurrency)"\s*:\s*"(?P<c>[A-Z]{3})"', html_text)
     if m:
-        sym = m.group(1)
-        amt = float(m.group(2).replace(",", ""))
-        ccy_map = {"€": "EUR", "$": "USD", "£": "GBP"}
-        return amt, ccy_map.get(sym)
+        pn = _parse_number_localized(m.group("p"))
+        return (pn, m.group("c")) if pn is not None else (None, None)
+
+    # 3) Видимые селекторы
+    cand = soup.select_one('[data-testid="price"], [data-test="price"], ._d85b45, ._e5f6a7, .price')
+    if cand:
+        txt = cand.get_text(" ", strip=True)
+        pn = _parse_number_localized(txt)
+        if pn is not None:
+            return pn, _guess_ccy(txt)
+
+    # 4) Общий фолбэк
+    txt = soup.get_text(" ", strip=True)
+    m2 = re.search(r'([€$£]|HK\$)\s?([\d.,]+)', txt)
+    if m2:
+        pn = _parse_number_localized(m2.group(0))
+        return pn, _guess_ccy(m2.group(0))
+
     return None, None
 
 async def fetch_rates(base=DEFAULT_BASE_CCY) -> dict[str, float]:
@@ -176,7 +293,7 @@ def convert(amount: float, ccy_from: str, base: str, rates: dict[str, float]) ->
 
 async def fetch_country_price(session: aiohttp.ClientSession, url: str, domain: str, country: str):
     target_url = set_country_in_url(url, country, domain)
-    _, text = await gentle_get(session, target_url)
+    _, text = await gentle_get(session, target_url, country=country)
     await asyncio.sleep(random.uniform(*PAUSE_BETWEEN_REQUESTS))
     if not text:
         return country, None, None, target_url
@@ -255,7 +372,6 @@ def build_table(per_link, totals, ok, ranking, base):
         val = "н/д" if not ok[cc] else f"{totals[cc]:,.2f} {base}"
         lines.append(f"{i}) {friendly_cc(cc)} — {val}")
     return "\n".join(lines)
-
 
 # -------------------------------
 # TELEGRAM BOT
