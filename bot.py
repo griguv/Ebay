@@ -1,136 +1,76 @@
 import os
-import re
-import httpx
 import logging
+import requests
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# -------------------- ЛОГИ --------------------
+# Логирование
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
 logger = logging.getLogger("price-bot")
 
-# -------------------- ПАРАМЕТРЫ --------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")   # именно BOT_TOKEN
-CHAT_IDS = os.environ.get("CHAT_IDS", "").split(",")
-PROXY_URL = os.environ.get("PROXY_URL")
+# Получаем токен и chat_ids из переменных окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS = os.getenv("CHAT_IDS", "").split(",")  # можно несколько id через запятую
+PRODUCT_URLS = [
+    "https://www.outdoordogsupply.com/products/used-garmin-320",
+    "https://www.outdoordogsupply.com/products/refurbished-garmin-t5-collar",
+    "https://www.outdoordogsupply.com/products/used-garmin-astro-t5-collars",
+    "https://www.outdoordogsupply.com/products/garmin-huntview-newest-edition"
+]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
-    )
-}
+if not BOT_TOKEN:
+    raise ValueError("Не найден BOT_TOKEN в переменных окружения!")
 
-# -------------------- ПРОКСИ --------------------
-proxies = None
-if PROXY_URL:
-    proxies = {
-        "http://": PROXY_URL,
-        "https://": PROXY_URL,
-    }
-
-# -------------------- ПАРСИНГ --------------------
-def parse_price_farfetch(html: str) -> str | None:
-    soup = BeautifulSoup(html, "html.parser")
-    price = None
-
-    # Новый Farfetch
-    span = soup.find("span", {"data-tstid": "priceInfo-original"})
-    if span:
-        price = span.get_text(strip=True)
-
-    if not price:
-        span = soup.find("span", string=re.compile(r"\$|€|£"))
-        if span:
-            price = span.get_text(strip=True)
-
-    return price
-
-
-def parse_price_ebay(html: str) -> str | None:
-    soup = BeautifulSoup(html, "html.parser")
-    price = None
-
-    span = soup.find("span", {"itemprop": "price"})
-    if span:
-        price = span.get_text(strip=True)
-
-    if not price:
-        span = soup.find("span", class_=re.compile(r"^\s*ux-textspans\s*"))
-        if span:
-            price = span.get_text(strip=True)
-
-    return price
-
-
-def get_price(url: str) -> str | None:
+# ====== Функции для парсинга ======
+def fetch_price(url: str) -> str:
     try:
-        with httpx.Client(headers=HEADERS, proxies=proxies, timeout=15) as client:
-            r = client.get(url)
-            if r.status_code != 200:
-                return None
-            html = r.text
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
 
-            if "farfetch" in url:
-                return parse_price_farfetch(html)
-            elif "ebay" in url:
-                return parse_price_ebay(html)
-            else:
-                return None
+        # Ищем цену
+        price = None
+        price_tag = soup.find(class_="price")
+        if price_tag:
+            price = price_tag.get_text(strip=True)
+        else:
+            # резервный поиск по $ или цифрам
+            for tag in soup.find_all(text=True):
+                if "$" in tag:
+                    price = tag.strip()
+                    break
+
+        return price if price else "Цена не найдена"
     except Exception as e:
-        logger.error("Ошибка при запросе %s: %s", url, e)
-        return None
+        logger.error(f"Ошибка при парсинге {url}: {e}")
+        return "Ошибка при парсинге"
 
-# -------------------- ХЕНДЛЕРЫ --------------------
+# ====== Команды бота ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отправь ссылку на товар (Farfetch или eBay).")
+    await update.message.reply_text("Бот запущен. Используй /check для проверки цен.")
 
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result_lines = []
+    for url in PRODUCT_URLS:
+        price = fetch_price(url)
+        result_lines.append(f"{url} → {price}")
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith("http"):
-        return
+    result = "\n".join(result_lines)
+    await update.message.reply_text(result)
 
-    await update.message.reply_text("Ищу цену...")
-
-    price = get_price(url)
-    if price:
-        text = f"Цена: {price}\nСсылка: {url}"
-    else:
-        text = f"Не удалось найти цену по ссылке: {url}"
-
-    await update.message.reply_text(text)
-
-    for chat_id in CHAT_IDS:
-        if chat_id:
-            try:
-                await context.bot.send_message(chat_id=chat_id.strip(), text=text)
-            except Exception as e:
-                logger.error("Не удалось отправить сообщение в %s: %s", chat_id, e)
-
-# -------------------- MAIN --------------------
+# ====== Основной запуск ======
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Не задан BOT_TOKEN в переменных окружения!")
-
-    try:
-        httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook", timeout=10)
-        logger.info("Webhook удалён перед запуском polling.")
-    except Exception as e:
-        logger.warning("Ошибка при удалении webhook: %s", e)
-
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(CommandHandler("check", check))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    # Запускаем без asyncio.run (фикс)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
