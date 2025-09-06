@@ -1,7 +1,6 @@
 import os
 import re
 import sys
-import asyncio
 import logging
 from typing import List, Dict
 from urllib.parse import urlparse
@@ -58,10 +57,10 @@ def is_supported_host(url: str) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         "Отправь ссылку (или несколько через пробел/новую строку) на товар Farfetch или YOOX.\n\n"
-        "Бот спарсит цену по странам: RU, TR, KZ, AE, HK и выведет таблицу.\n"
+        "Бот спарсит цену по странам: RU, TR, KZ, AE, HK, ES и выведет таблицу.\n"
         "Если ссылок несколько, бот пройдётся по каждой и покажет блоки по ссылкам.\n\n"
         "_Подсказка_: капчи обходим заголовками и (при необходимости) прокси. "
-        "Для прокси можно задать переменные PROXY_RU/TR/KZ/AE/HK."
+        "Для прокси можно задать переменные PROXY_RU/TR/KZ/AE/HK/ES."
     )
     await update.message.reply_text(msg, disable_web_page_preview=True)
 
@@ -104,33 +103,30 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # -----------------------------
 # MAIN
 # -----------------------------
-async def main() -> None:
+def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
     app.add_error_handler(error_handler)
 
-    # Важно: убираем вебхук перед polling и чистим очереди
-    await app.bot.delete_webhook(drop_pending_updates=True)
+    app.bot.delete_webhook(drop_pending_updates=True)
     logger.info("Webhook удалён перед запуском polling.")
 
     try:
         # один-единственный polling-процесс
-        await app.run_polling(
+        app.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            close_loop=False,                 # не трогаем глобальный loop (Render)
-            stop_signals=None,                # Render сам управляет сигналами
+            close_loop=False,   # не трогаем глобальный loop (Render)
+            stop_signals=None,  # Render сам управляет сигналами
             drop_pending_updates=True,
         )
     except Conflict as e:
-        # Если уже есть другой процесс getUpdates — логируем и завершаем
         logger.error("Конфликт polling: %s. Похоже, уже запущен другой инстанс.", e)
-        # мягко завершаем приложение, чтобы Render не перезапускал бесконечно
         try:
-            await app.shutdown()
+            app.shutdown()
         finally:
             sys.exit(0)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
