@@ -1,166 +1,136 @@
-import asyncio
-import logging
 import os
 import re
-from typing import List, Tuple
+import sys
+import asyncio
+import logging
+from typing import List, Dict
+from urllib.parse import urlparse
 
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
+)
+from telegram.error import Conflict
+
+from price_parsers import (
+    get_prices_across_countries,
+    format_prices_table,
 )
 
-from utils import logger, get_bot_token, COUNTRIES, is_supported_url, site_name, get_proxy_config
-from price_parsers import get_prices_across_countries
+# -----------------------------
+# ЛОГИРОВАНИЕ
+# -----------------------------
+logger = logging.getLogger("price-bot")
+if not logger.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
 
-# ----------------- КОМАНДЫ -----------------
+TOKEN_ENV = "БОТ_ТОКЕН"  # ИМЯ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ — НЕ МЕНЯЕМ
+BOT_TOKEN = os.getenv(TOKEN_ENV)
+if not BOT_TOKEN:
+    print(f"Переменная окружения {TOKEN_ENV} не задана", file=sys.stderr)
+    sys.exit(1)
 
-HELP_TEXT = (
-    "Пришлите 1 или несколько ссылок на товары с Farfetch или YOOX "
-    "(каждую с новой строки или через пробел). Я сравню цены по фиксированным "
-    f"странам: {', '.join(COUNTRIES)}.\n\n"
-    "Если ссылок несколько — суммы по каждой стране будут просуммированы и выведены итогом."
-)
+# -----------------------------
+# ВСПОМОГАТЕЛЬНОЕ
+# -----------------------------
+URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
-def extract_urls(text: str) -> List[str]:
-    # простая выборка ссылок
-    urls = re.findall(r"https?://[^\s]+", text)
-    # фильтруем под поддерживаемые домены
-    return [u.strip(").,") for u in urls if is_supported_url(u)]
+def extract_links(text: str) -> List[str]:
+    if not text:
+        return []
+    return [m.group(0).strip(" \t\r\n,") for m in URL_RE.finditer(text)]
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Готов 🚀\n" + HELP_TEXT
+def is_supported_host(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return ("farfetch." in host) or ("yoox." in host) or ("yoox.com" in host)
+
+# -----------------------------
+# ХЕНДЛЕРЫ
+# -----------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = (
+        "Отправь ссылку (или несколько через пробел/новую строку) на товар Farfetch или YOOX.\n\n"
+        "Бот спарсит цену по странам: RU, TR, KZ, AE, HK и выведет таблицу.\n"
+        "Если ссылок несколько, бот пройдётся по каждой и покажет блоки по ссылкам.\n\n"
+        "_Подсказка_: капчи обходим заголовками и (при необходимости) прокси. "
+        "Для прокси можно задать переменные PROXY_RU/TR/KZ/AE/HK."
     )
+    await update.message.reply_text(msg, disable_web_page_preview=True)
 
-async def countries(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Фиксированный список стран:\n" + ", ".join(COUNTRIES)
-    )
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
-
-# ----------------- ОБРАБОТКА ССЫЛОК -----------------
-
-async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
-    urls = extract_urls(text)
-
-    if not urls:
-        await update.message.reply_text("Не нашёл поддерживаемых ссылок. Нужны Farfetch или YOOX.")
+    links = extract_links(text)
+    if not links:
+        await update.message.reply_text("Не вижу ссылок. Пришли URL Farfetch или YOOX.")
         return
 
-    await update.message.reply_text(f"Принял {len(urls)} ссылок. Работаю…")
+    supported = [u for u in links if is_supported_host(u)]
+    unsupported = [u for u in links if u not in supported]
+    if unsupported:
+        await update.message.reply_text(
+            "Пропущены несуппорченные ссылки:\n" + "\n".join(unsupported),
+            disable_web_page_preview=True,
+        )
 
-    # собираем цены по всем странам для каждой ссылки
-    link_results = []
-    for url in urls:
+    if not supported:
+        await update.message.reply_text("Пришли ссылку на Farfetch или YOOX.")
+        return
+
+    for url in supported:
         try:
-            prices = await get_prices_across_countries(url)
-            link_results.append((url, prices))
+            prices_by_country: Dict[str, Dict[str, str]] = await get_prices_across_countries(url)
+            table = format_prices_table(prices_by_country)
+            text_out = f"<b>URL</b>: {url}\n<pre>{table}</pre>"
+            await update.message.reply_text(
+                text_out,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         except Exception as e:
-            logger.exception(f"Ошибка парсинга {url}: {e}")
-            await update.message.reply_text(f"Ошибка при парсинге {url}: {e}")
-            return
+            logger.error("Ошибка парсинга %s: %s", url, e, exc_info=True)
+            await update.message.reply_text(f"Ошибка парсинга: {e}")
 
-    # Суммируем по странам
-    totals = {c: 0.0 for c in COUNTRIES}
-    any_price_for_country = {c: False for c in COUNTRIES}
-    lines = []
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled error: %s", context.error, exc_info=True)
 
-    for url, prices in link_results:
-        name = site_name(url)
-        lines.append(f"— [{name}] {url}")
-        for c in COUNTRIES:
-            info = prices.get(c, {})
-            price = info.get("price")
-            curr = info.get("currency")
-            status = info.get("status", 0)
-            if price is not None:
-                any_price_for_country[c] = True
-                totals[c] += float(price)
-                lines.append(f"   {c}: {price:.2f} {curr or ''} (HTTP {status})")
-            else:
-                if status in (403, 429, 503, 0):
-                    lines.append(f"   {c}: недоступно (возможно CAPTCHA/блок) (HTTP {status})")
-                else:
-                    lines.append(f"   {c}: не удалось извлечь цену (HTTP {status})")
-
-    # Итоги
-    lines.append("\nИТОГО по странам (сумма по всем ссылкам):")
-    for c in COUNTRIES:
-        if any_price_for_country[c]:
-            lines.append(f"   {c}: {totals[c]:.2f} (суммарно; валюта может отличаться по ссылкам)")
-        else:
-            lines.append(f"   {c}: —")
-
-    # Telegram ограничивает длину сообщений — разобьём при необходимости
-    output = "\n".join(lines)
-    if len(output) < 3900:
-        await update.message.reply_text(output)
-    else:
-        # режем на части
-        chunks = []
-        cur = []
-        size = 0
-        for line in lines:
-            if size + len(line) + 1 > 3900:
-                chunks.append("\n".join(cur))
-                cur = [line]
-                size = len(line) + 1
-            else:
-                cur.append(line)
-                size += len(line) + 1
-        if cur:
-            chunks.append("\n".join(cur))
-        for ch in chunks:
-            await update.message.reply_text(ch)
-
-# ----------------- MAIN -----------------
-
-def build_application() -> Application:
-    token = get_bot_token()
-
-    # Если нужен прокси для обращения к Telegram (чаще не нужен),
-    # то можно настроить через переменные окружения MTProto/HTTPS прокси
-    # В PTB21 прокси для самого Telegram бота настраивают через Request(..., proxy_url=...),
-    # но здесь мы используем прокси только для HTTP-запросов к сайтам (price_parsers),
-    # т.к. Telegram API обычно не блокируется на Render.
-    app = Application.builder().token(token).build()
+# -----------------------------
+# MAIN
+# -----------------------------
+async def main() -> None:
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("countries", countries))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_links))
-
-    # Логируем необработанные ошибки
-    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        logger.exception("Unhandled error: %s", context.error)
-
     app.add_error_handler(error_handler)
 
-    return app
+    # Важно: убираем вебхук перед polling и чистим очереди
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook удалён перед запуском polling.")
+
+    try:
+        # один-единственный polling-процесс
+        await app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False,                 # не трогаем глобальный loop (Render)
+            stop_signals=None,                # Render сам управляет сигналами
+            drop_pending_updates=True,
+        )
+    except Conflict as e:
+        # Если уже есть другой процесс getUpdates — логируем и завершаем
+        logger.error("Конфликт polling: %s. Похоже, уже запущен другой инстанс.", e)
+        # мягко завершаем приложение, чтобы Render не перезапускал бесконечно
+        try:
+            await app.shutdown()
+        finally:
+            sys.exit(0)
 
 if __name__ == "__main__":
-    # ВАЖНО: не оборачиваем run_polling в asyncio.run — это и вызывало ошибки с event loop.
-    app = build_application()
-
-    # На всякий случай удаляем webhook перед polling
-    # (если ранее бот был на вебхуках)
-    try:
-        asyncio.get_event_loop().run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
-        logger.info("Webhook удалён перед запуском polling.")
-    except Exception as e:
-        logger.warning(f"Не удалось удалить webhook: {e}")
-
-    # Если где-то уже крутится другой polling — Telegram вернёт 409 Conflict.
-    # В этом случае просто упадём с логом, чтобы не плодить дубликаты.
-    try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None, close_loop=False)
-    except Exception as e:
-        logger.exception(f"run_polling error: {e}")
-        raise
+    asyncio.run(main())
