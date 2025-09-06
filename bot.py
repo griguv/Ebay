@@ -16,8 +16,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # -------------------------------
 # CONFIG
 # -------------------------------
-# Токен встроен по твоей просьбе, но лучше хранить в переменной окружения TELEGRAM_BOT_TOKEN
-TOKEN = "8406115807:AAGo1ECglKWEVDcb6oSy_yaVuJFmOA_U-ys"
+# Токен встроен по просьбе владельца. Для безопасности можно задать TELEGRAM_BOT_TOKEN в окружении.
+TOKEN = "7950356051:AAEpLiWpGFUwj38b6AyUJcjYYmauUrmLuAU"
 OWNER_ID = 200156484  # только этот пользователь может пользоваться ботом. Поставь None для всех
 
 DEFAULT_COUNTRIES = ["us", "de", "fr", "it", "es", "uk", "hk", "kz"]
@@ -27,10 +27,10 @@ PAUSE_BETWEEN_REQUESTS = (1.2, 2.1)
 MAX_RETRIES = 2
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) Chrome/124.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile Safari/604.1",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
 ]
 
